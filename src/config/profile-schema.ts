@@ -5,6 +5,7 @@ import type {
   SecretsConfig,
 } from './schema';
 import {
+  isAccessMode,
   normalizePermissions,
   permissionsToLegacySandbox,
   type AccessMode,
@@ -58,6 +59,14 @@ export interface AttachmentConfig {
   imageMaxBytes: number;
   cacheTtlMs: number;
   cacheMaxBytes: number;
+  /**
+   * From this many accepted attachments in one batch on, they are also linked
+   * into `<workspace>/.lark-batches/<time>-<hash>/` (in delivery order, real
+   * file names, plus a manifest.json) so the agent can address "the 3rd one".
+   */
+  batchThreshold: number;
+  /** How many batch directories to keep; oldest are removed first. */
+  batchKeep: number;
 }
 
 export type CommentConfig = Record<string, never>;
@@ -107,6 +116,40 @@ export interface MeetingConfig {
   summaryOnEnd: boolean;
   /** Preferred destination for that summary. See {@link MeetingSummaryTarget}. */
   summaryTarget: MeetingSummaryTarget;
+  /**
+   * Who may drive the agent from in-meeting chat. Joining a meeting makes the
+   * bot visible to every participant; it does not make every participant
+   * allowed to run it.
+   *  - `dm-policy`: the same people who may DM the bot (owner, team mode,
+   *    admins, allowedUsers).
+   *  - `admins-only`: only those who may run admin commands.
+   */
+  access: MeetingAccess;
+  /** Access tier for runs triggered from meeting chat (capped by the profile's maxAccess). */
+  executionAccess: AccessMode;
+  /**
+   * Word that, right after the trigger, runs one request with the profile's
+   * default access instead of `executionAccess`. Empty = no elevation at all.
+   */
+  elevateWord: string;
+  /** Literal keyword / speaker alerts on the transcript, DMed to the owner. */
+  alerts: MeetingAlertsConfig;
+}
+
+export type MeetingAccess = 'dm-policy' | 'admins-only';
+
+export interface MeetingAlertsConfig {
+  /** Case-insensitive substrings of a transcript line. */
+  keywords: string[];
+  /** Speaker open_id or display name (case-insensitive). */
+  speakers: string[];
+  /** Minimum gap between two alerts for the same keyword. */
+  cooldownMs: number;
+  /**
+   * Minimum gap for the same speaker. Much longer than the keyword one: while
+   * a watched speaker is presenting, every line matches.
+   */
+  speakerCooldownMs: number;
 }
 
 export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
@@ -291,6 +334,8 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
       imageMaxBytes: numberOr(raw.attachments?.imageMaxBytes, 25 * 1024 * 1024),
       cacheTtlMs: numberOr(raw.attachments?.cacheTtlMs, 24 * 60 * 60 * 1000),
       cacheMaxBytes: numberOr(raw.attachments?.cacheMaxBytes, 512 * 1024 * 1024),
+      batchThreshold: clampNumber(raw.attachments?.batchThreshold, 1, 100, ATTACHMENT_BATCH_DEFAULTS.batchThreshold),
+      batchKeep: clampNumber(raw.attachments?.batchKeep, 1, 500, ATTACHMENT_BATCH_DEFAULTS.batchKeep),
     },
     comments,
     meeting,
@@ -405,7 +450,16 @@ export const MEETING_DEFAULTS: MeetingConfig = {
   pollIntervalMs: 3000,
   summaryOnEnd: false,
   summaryTarget: 'origin',
+  // Unconfigured = safe: the DM allowlist decides, runs are read-only and
+  // there is no way to elevate.
+  access: 'dm-policy',
+  executionAccess: 'read-only',
+  elevateWord: '',
+  // Empty lists = no alerts at all.
+  alerts: { keywords: [], speakers: [], cooldownMs: 60_000, speakerCooldownMs: 300_000 },
 };
+
+export const ATTACHMENT_BATCH_DEFAULTS = { batchThreshold: 3, batchKeep: 20 } as const;
 
 function normalizeMeeting(input: unknown): MeetingConfig {
   const raw = (input && typeof input === 'object' ? input : {}) as {
@@ -417,6 +471,10 @@ function normalizeMeeting(input: unknown): MeetingConfig {
     pollIntervalMs?: unknown;
     summaryOnEnd?: unknown;
     summaryTarget?: unknown;
+    access?: unknown;
+    executionAccess?: unknown;
+    elevateWord?: unknown;
+    alerts?: unknown;
   };
   const trigger = typeof raw.trigger === 'string' && raw.trigger.trim() ? raw.trigger.trim() : MEETING_DEFAULTS.trigger;
   return {
@@ -438,6 +496,33 @@ function normalizeMeeting(input: unknown): MeetingConfig {
       raw.summaryTarget === 'owner' || raw.summaryTarget === 'origin'
         ? raw.summaryTarget
         : MEETING_DEFAULTS.summaryTarget,
+    access: raw.access === 'admins-only' ? 'admins-only' : MEETING_DEFAULTS.access,
+    executionAccess: isAccessMode(raw.executionAccess) ? raw.executionAccess : MEETING_DEFAULTS.executionAccess,
+    elevateWord:
+      typeof raw.elevateWord === 'string' && raw.elevateWord.trim()
+        ? raw.elevateWord.trim()
+        : MEETING_DEFAULTS.elevateWord,
+    alerts: normalizeMeetingAlerts(raw.alerts),
+  };
+}
+
+/** Blank entries are dropped: an empty keyword would match every line. */
+export function normalizeMeetingAlerts(input: unknown): MeetingAlertsConfig {
+  const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as {
+    keywords?: unknown;
+    speakers?: unknown;
+    cooldownMs?: unknown;
+    speakerCooldownMs?: unknown;
+  };
+  const list = (v: unknown): string[] =>
+    Array.isArray(v)
+      ? [...new Set(v.filter((x): x is string => typeof x === 'string').map((x) => x.trim()).filter(Boolean))]
+      : [];
+  return {
+    keywords: list(raw.keywords),
+    speakers: list(raw.speakers),
+    cooldownMs: clampNumber(raw.cooldownMs, 0, 3_600_000, MEETING_DEFAULTS.alerts.cooldownMs),
+    speakerCooldownMs: clampNumber(raw.speakerCooldownMs, 0, 3_600_000, MEETING_DEFAULTS.alerts.speakerCooldownMs),
   };
 }
 

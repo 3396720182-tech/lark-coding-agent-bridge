@@ -1,7 +1,7 @@
 import type { NormalizedMessage } from '@larksuite/channel';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from '../../../src/agent/types.js';
 import type { FakeAgentEvents } from '../../helpers/fake-agent.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
@@ -82,6 +82,10 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  // These cases wait out the real grace window; keep it at the old 3 s.
+  beforeAll(() => vi.stubEnv('LARK_STREAM_TERMINAL_GRACE_MS', '3000'));
+  afterAll(() => vi.unstubAllEnvs());
+
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {
     const h = await createHarness();
     await startTestBridge(h);

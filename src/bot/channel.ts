@@ -46,6 +46,9 @@ import {
   toPromptAttachment,
 } from '../media/attachment';
 import { canUseDm, canUseGroup, requireMentionForChat } from '../policy/access';
+import { resolveWorkingDirectory } from '../policy/workspace';
+import { batchInstructions, landAttachmentBatch, renderAttachmentNotice, type LandedBatch } from '../media/batch';
+import { meetingAccessConverged, meetingEffectiveAccess } from '../meeting/authz';
 import { describeMeetingError, MeetingManager } from '../meeting/manager';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
@@ -76,7 +79,14 @@ import {
 } from './cot';
 
 const DEBOUNCE_MS = 600;
-const STREAM_TERMINAL_GRACE_MS = 3000;
+// Card creation is two API round trips and can take well over 3 s under load;
+// replying with a plain-text fallback too early posts the same answer twice.
+// `LARK_STREAM_TERMINAL_GRACE_MS` overrides it (tests use the old 3 s).
+const DEFAULT_STREAM_TERMINAL_GRACE_MS = 30_000;
+function streamTerminalGraceMs(): number {
+  const n = Number(process.env.LARK_STREAM_TERMINAL_GRACE_MS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_STREAM_TERMINAL_GRACE_MS;
+}
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
@@ -487,6 +497,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         }),
     });
     meetingManager.attachPush();
+    // One line per start that proves the in-meeting gate is in this build and
+    // shows its effective setting.
+    log.info('meeting', 'authz-active', {
+      gate: meetingConfig().access,
+      executionAccess: meetingConfig().executionAccess,
+      effective: meetingEffectiveAccess(controls.profileConfig, false),
+      converged: meetingAccessConverged(controls.profileConfig),
+      elevateWord: meetingConfig().elevateWord || '(disabled)',
+    });
     controls.meeting = meetingManager;
   }
 
@@ -878,6 +897,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // Dropped attachments are never silent. Empty when everything was accepted.
+  const attachmentNotice = renderAttachmentNotice(attachments);
+  if (attachmentNotice) log.info('attachment', 'notice', { text: attachmentNotice });
+
   // Collect any reply-quote targets in the batch. Dedup so the same target
   // quoted by multiple messages in one batch only fetches once. Filter out
   // ids that are themselves in the batch — those are already in the prompt.
@@ -924,6 +947,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
+  // Several attachments → also link them into a batch directory in the
+  // workspace. buildPrompt runs before startRunFlow resolves the cwd, so
+  // resolve it here with the same inputs. A convenience only: on failure the
+  // per-attachment paths are still in the prompt.
+  let attachmentBatch: LandedBatch | undefined;
+  try {
+    const wsReq = workspaces.cwdFor(scope) ?? controls.profileConfig.workspaces.default ?? '';
+    const ws = wsReq ? await resolveWorkingDirectory(wsReq) : undefined;
+    if (ws?.ok) {
+      attachmentBatch = await landAttachmentBatch(attachments, ws.cwdRealpath, controls.profileConfig.attachments);
+      if (attachmentBatch) {
+        log.info('attachment', 'batch-landed', {
+          dir: attachmentBatch.dir,
+          count: attachmentBatch.count,
+          linked: attachmentBatch.items.filter((i) => i.linked).length,
+        });
+      }
+    }
+  } catch (err) {
+    log.warn('attachment', 'batch-failed', { err: String(err) });
+    attachmentBatch = undefined;
+  }
+
   // Detect a model switch since this scope's last run. When resuming an
   // existing conversation the transcript still claims the old model, so tell
   // the (now-switched) agent its model changed — otherwise it keeps echoing
@@ -945,13 +991,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       ]
     : undefined;
 
+  const allInstructions = [...(extraInstructions ?? []), ...(attachmentBatch ? batchInstructions(attachmentBatch) : [])];
   const prompt = buildPrompt(
     batch,
     attachments,
     quotes,
     topicContext,
     channel.botIdentity,
-    extraInstructions,
+    allInstructions.length > 0 ? allInstructions : undefined,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -1078,10 +1125,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
-  const filterForPrefs = (state: RunState): RunState => {
-    if (getShowToolCalls(controls.cfg)) return state;
-    return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
-  };
+  const filterForPrefs = (state: RunState): RunState => collapseToolBlocks(state, getShowToolCalls(controls.cfg));
   const cardRenderOptions = callbackAuth
     ? {
         signCallback: (action: string) =>
@@ -1746,14 +1790,14 @@ async function awaitRenderAwareStream(input: {
   // fallback would post the same answer twice once the stream catches up.
   const terminal = await Promise.race([
     streamResult,
-    delay(STREAM_TERMINAL_GRACE_MS).then(() => undefined),
+    delay(streamTerminalGraceMs()).then(() => undefined),
   ]);
 
   if (!terminal) {
     if (input.producerStarted()) {
       log.warn('stream', 'terminal-grace-expired', {
         mode: input.mode,
-        graceMs: STREAM_TERMINAL_GRACE_MS,
+        graceMs: streamTerminalGraceMs(),
       });
       void streamResult.then((result) => {
         if (!result.ok) {
@@ -2003,4 +2047,23 @@ function parseJsonOrRaw(input: string): unknown {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+/**
+ * Tool lines are useful while a run is in flight; on the final frame they bury
+ * the answer. Once terminal, replace them with a count — unless the run has no
+ * text at all (an empty card would render as "(no content)").
+ * `LARK_KEEP_TOOL_CALLS=1` keeps them.
+ */
+export function collapseToolBlocks(state: RunState, showToolCalls: boolean): RunState {
+  if (!showToolCalls) return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
+  if (state.terminal === 'running' || process.env.LARK_KEEP_TOOL_CALLS) return state;
+  const tools = state.blocks.filter((b) => b.kind === 'tool').length;
+  if (tools === 0) return state;
+  const kept = state.blocks.filter((b) => b.kind !== 'tool');
+  if (!kept.some((b) => b.kind === 'text' && b.content.trim() !== '')) return state;
+  return {
+    ...state,
+    blocks: [...kept, { kind: 'text', content: `_🧰 ${tools} 次工具调用已折叠_`, streaming: false }],
+  };
 }

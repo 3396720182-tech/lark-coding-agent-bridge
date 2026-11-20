@@ -34,6 +34,10 @@ export interface MeetingSessionStatus {
    */
   eventCounts: Record<string, number>;
   ended: boolean;
+  /** In-meeting triggers refused by the authorization gate. */
+  deniedCount: number;
+  /** Transcript lines that fired a keyword / speaker alert. */
+  alertHits: number;
 }
 
 export interface MeetingSessionDeps {
@@ -114,6 +118,13 @@ export class MeetingSession {
   private stopped = false;
   private leaving = false;
   ended = false;
+  /** Bumped by the in-meeting authorization gate (see authz.ts). */
+  deniedCount = 0;
+  /** Bumped by the alert matcher (see alerts.ts). */
+  alertHits = 0;
+  /** Alert state lives with the meeting: a new meeting alerts afresh. */
+  readonly alertFired = new Map<string, Set<string>>();
+  readonly alertCooldown = new Map<string, number>();
 
   constructor(deps: MeetingSessionDeps) {
     this.client = deps.client;
@@ -139,6 +150,8 @@ export class MeetingSession {
       ingested: this.ingested,
       eventCounts: { ...this.eventCounts },
       ended: this.ended,
+      deniedCount: this.deniedCount,
+      alertHits: this.alertHits,
     };
   }
 
