@@ -127,8 +127,9 @@ export type MeetingNoExtraction =
 export function extractMeetingNo(input: unknown): MeetingNoExtraction {
   const raw = String(input ?? '');
   const scan = (t: string): string[] => {
-    // Drop query/fragment first: `?password=123456789` is not a candidate.
-    const core = t.split(/[?#]/)[0] ?? '';
+    // Drop the query/fragment of links: `?password=123456789` is not a
+    // candidate. Only inside a link — "能进吗? 123456789" keeps its number.
+    const core = t.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s?#]*)[?#]\S*/gi, '$1');
     const hits: string[] = [];
     // No digit directly on either side, or an 11-digit phone number would yield 9 digits.
     for (const m of core.matchAll(/(?<![0-9])([0-9]{9})(?![0-9])/g)) hits.push(m[1]!);

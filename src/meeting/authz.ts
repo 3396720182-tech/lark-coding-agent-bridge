@@ -56,14 +56,22 @@ function deny(
 }
 
 /**
- * Access tier for an in-meeting run: `executionAccess`, or the profile's
- * default when elevated — never above the profile's `maxAccess`
- * (`clampAccess` clamps once more downstream).
+ * Access tier for an in-meeting run: `executionAccess`; when elevated, the
+ * higher of that and the profile's default — never above the profile's
+ * `maxAccess` (`clampAccess` clamps once more downstream).
  */
 export function meetingEffectiveAccess(profile: ProfileConfig, elevate: boolean): AccessMode {
-  const wanted = elevate ? profile.permissions.defaultAccess : profile.meeting.executionAccess;
+  const base = profile.meeting.executionAccess;
+  const def = profile.permissions.defaultAccess;
+  const wanted = elevate && ACCESS_ORDER[def] > ACCESS_ORDER[base] ? def : base;
   const max = profile.permissions.maxAccess;
   return ACCESS_ORDER[wanted] <= ACCESS_ORDER[max] ? wanted : max;
+}
+
+/** Entries other than in-meeting chat (`/meeting ask|notes`, the summary): read-only, capped by maxAccess. */
+export function meetingReadOnlyAccess(profile: ProfileConfig): AccessMode {
+  const max = profile.permissions.maxAccess;
+  return ACCESS_ORDER['read-only'] <= ACCESS_ORDER[max] ? 'read-only' : max;
 }
 
 /** True when the configured tier was lowered by the profile's maxAccess. */
@@ -124,6 +132,19 @@ export function meetingAuthzGate(
   if (meeting.elevateWord) {
     const stripped = matchElevation(meeting.elevateWord);
     if (stripped !== undefined) {
+      // Elevation is for admins only: in team mode everyone in the meeting
+      // passes the DM policy, including people outside the tenant.
+      if (!canRunAdminCommand(profile, controls, senderId).ok) {
+        deny(deps, 'elevate-not-admin', senderId);
+        return { ok: false };
+      }
+      // Nothing to elevate to (the default is not above the meeting tier).
+      if (meetingEffectiveAccess(profile, true) === meetingEffectiveAccess(profile, false)) {
+        void deps.session
+          .sendMessage(`提权没有效果：本 bot 的默认档位不高于会中档位（${meetingEffectiveAccess(profile, false)}），未执行。`)
+          .catch(() => {});
+        return { ok: false };
+      }
       elevate = true;
       text = stripped;
     }

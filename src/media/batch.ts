@@ -1,5 +1,6 @@
-import { mkdir, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { lstat, mkdir, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { join, sep } from 'node:path';
 import { log } from '../core/logger';
 import { safeExtensionForMime, type NormalizedAttachment } from './attachment';
 
@@ -97,10 +98,20 @@ export async function landAttachmentBatch(
   if (accepted.length < cfg.batchThreshold) return undefined;
   if (!cwdRealpath) return undefined;
   const root = join(cwdRealpath, ATTACHMENT_BATCH_DIR);
+  // The bridge is not sandboxed: never follow a `.lark-batches` that is a
+  // link (an agent or a cloned repo could point it anywhere, and pruning
+  // deletes inside it).
+  await mkdir(root, { recursive: true });
+  const st = await lstat(root);
+  const real = await realpath(root);
+  if (!st.isDirectory() || st.isSymbolicLink() || !real.startsWith(cwdRealpath + sep)) {
+    throw new Error(`${ATTACHMENT_BATCH_DIR} is not a plain directory inside the workspace`);
+  }
   const stamp = now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
   const short = (accepted[0]?.hash ?? String(now.getTime())).slice(0, 8);
-  const dir = join(root, `${stamp}-${short}`);
-  await mkdir(dir, { recursive: true });
+  // Random suffix: two scopes sharing a workspace can land the same first file in the same second.
+  const dir = join(root, `${stamp}-${short}-${randomBytes(3).toString('hex')}`);
+  await mkdir(dir);
   const items: LandedBatch['items'] = [];
   for (const [i, a] of accepted.entries()) {
     const name = safeAttachmentName(i, a);
@@ -135,10 +146,21 @@ export async function landAttachmentBatch(
   return { dir, count: items.length, items };
 }
 
-/** Keep the newest `keep` batches. Names start with a timestamp, so name order is time order. */
+/**
+ * Keep the newest `keep` batches. Names start with a timestamp, so name order
+ * is time order. Only real directories that hold a manifest.json count as
+ * batches; anything else in there is left alone.
+ */
 export async function pruneAttachmentBatches(root: string, keep: number): Promise<void> {
+  const st = await lstat(root).catch(() => undefined);
+  if (!st || !st.isDirectory() || st.isSymbolicLink()) return;
   const entries = await readdir(root).catch(() => [] as string[]);
-  const dirs = entries.filter((n) => /^\d{8,14}-/.test(n)).sort();
+  const dirs: string[] = [];
+  for (const n of entries.filter((x) => /^\d{8,14}-/.test(x)).sort()) {
+    const e = await lstat(join(root, n)).catch(() => undefined);
+    const m = e?.isDirectory() ? await lstat(join(root, n, 'manifest.json')).catch(() => undefined) : undefined;
+    if (e && e.isDirectory() && !e.isSymbolicLink() && m?.isFile()) dirs.push(n);
+  }
   if (dirs.length <= keep) return;
   for (const name of dirs.slice(0, dirs.length - keep)) {
     await rm(join(root, name), { recursive: true, force: true }).catch(() => {});

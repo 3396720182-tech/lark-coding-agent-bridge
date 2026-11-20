@@ -11,9 +11,9 @@ import type { WorkspaceStore } from '../workspace/store';
 import { startRunFlow } from '../bot/run-flow';
 import { describeMeetingError } from './manager';
 import { attachMeetingAlerts } from './alerts';
-import { meetingAuthzGate, meetingEffectiveAccess } from './authz';
+import { meetingAuthzGate, meetingEffectiveAccess, meetingReadOnlyAccess } from './authz';
 import type { MeetingSession } from './session';
-import type { MeetingSummaryTarget } from '../config/profile-schema';
+import type { AccessMode, MeetingSummaryTarget } from '../config/profile-schema';
 import type { ChatEvent, MeetingEvent } from './types';
 
 /**
@@ -109,8 +109,12 @@ export function matchElevation(content: string, prefixes: string[], word: string
   for (const prefix of prefixes) {
     const p = prefix.trim();
     if (!p) continue;
-    const re = new RegExp(`${escapeRe(p)}[\\s,，、:：]*${escapeRe(w)}(?=$|[\\s,，、:：。.!！?？])`, 'i');
-    const m = re.exec(content);
+    const re = new RegExp(`${escapeRe(p)}[\\s,，、:：]*${escapeRe(w)}(?=$|[\\s,，、:：。.!！?？])`, 'gi');
+    let m: RegExpExecArray | null;
+    // Same left boundary as the trigger: `foo@bot !write` is an email-ish token, not a mention.
+    while ((m = re.exec(content)) && EMAIL_LOCAL.test(content[m.index - 1] ?? '')) {
+      /* keep looking */
+    }
     if (!m) continue;
     return `${content.slice(0, m.index)} ${content.slice(m.index + m[0].length)}`
       .replace(/^[\s,，、:：。.!！?？~～-]+/, '')
@@ -196,7 +200,7 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
       // policy: read-only history is not carried into a writable session.
       void session
         .sendMessage(
-          `⚠️ 本次以写权限执行（由 ${chat.from.name ?? '授权用户'} 发起）。提权会切换会话，不带之前的会中对话历史。`,
+          `⚠️ 本次以 ${meetingEffectiveAccess(controls.profileConfig, true)} 权限执行（由 ${chat.from.name ?? '授权用户'} 发起）。提权会切换会话，不带之前的会中对话历史。`,
         )
         .catch((err) => log.warn('meeting', 'elevate-notice-failed', { err: String(err) }));
     }
@@ -256,7 +260,13 @@ export async function answerInMeeting(
     ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
   });
 
-  const answer = await runMeetingAgent(deps, prompt, opts.usedPrefix, opts.elevate === true);
+  // In-meeting chat runs at the meeting tier (or elevated); everything else
+  // (`/meeting ask|notes`, the summary) is read-only: its input is meeting content.
+  const tier =
+    opts.deliver === 'broadcast'
+      ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
+      : meetingReadOnlyAccess(controls.profileConfig);
+  const answer = await runMeetingAgent(deps, prompt, opts.usedPrefix, opts.elevate === true, tier);
   if (!answer) return '';
   // The caller relays it themselves; never echo into the meeting.
   if (opts.deliver === 'caller') return answer;
@@ -460,6 +470,7 @@ async function runMeetingAgent(
   prompt: string,
   usedPrefix?: string,
   elevate = false,
+  tier: AccessMode = meetingReadOnlyAccess(deps.controls.profileConfig),
 ): Promise<string> {
   const { session, controls } = deps;
   const scopeId = meetingScopeId(session.meetingId);
@@ -469,7 +480,6 @@ async function runMeetingAgent(
       : claudeCapability(controls.profileConfig);
   // Lowering capability.permissions.maxAccess is enough: clampAccess takes
   // min(defaultAccess, profile max, capability max).
-  const tier = meetingEffectiveAccess(controls.profileConfig, elevate);
   const capability = { ...base, permissions: { ...base.permissions, maxAccess: tier } };
   if (elevate) {
     log.warn('meeting', 'elevated', { meetingId: session.meetingId, meetingNo: session.meetingNo, tier, stage: 'start' });

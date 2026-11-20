@@ -241,7 +241,21 @@ describe('in-meeting authorization', () => {
     const second = mocks.startRunFlow.mock.calls[1]![0];
     expect(second.capability.permissions.maxAccess).toBe('workspace');
     expect(second.prompt).toContain('改一下 README');
-    expect(said.some((t) => t.includes('本次以写权限执行'))).toBe(true);
+    expect(said.some((t) => t.includes('本次以 workspace 权限执行'))).toBe(true);
+  });
+});
+
+describe('entries other than meeting chat are read-only', () => {
+  it('/meeting ask and notes run read-only even when the meeting tier is higher', async () => {
+    const config = cfg({ executionAccess: 'workspace' });
+    const s = makeSession(config);
+    const d = deps(s, config, { botOwnerId: 'ou_owner' });
+    const pc = (d.args as { controls: { profileConfig: { permissions: { maxAccess: string } } } }).controls.profileConfig;
+    pc.permissions.maxAccess = 'full';
+    await answerInMeeting(d.args, '总结', { deliver: 'caller' });
+    expect(mocks.startRunFlow.mock.calls[0]![0].capability.permissions.maxAccess).toBe('read-only');
+    await answerInMeeting(d.args, '总结', { deliver: 'broadcast' });
+    expect(mocks.startRunFlow.mock.calls[1]![0].capability.permissions.maxAccess).toBe('workspace');
   });
 });
 

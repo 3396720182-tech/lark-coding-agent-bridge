@@ -7,6 +7,8 @@ describe('extractMeetingNo', () => {
     ['会议号 123 456 789 进来', '123456789'],
     ['https://vc.example.com/j/123456789?pwd=987654321', '123456789'],
     ['123-456-789', '123456789'],
+    ['能进吗? 123456789', '123456789'],
+    ['会议 #123456789', '123456789'],
   ])('%s', (input, want) => {
     expect(extractMeetingNo(input)).toEqual({ ok: true, meetingNo: want });
   });
