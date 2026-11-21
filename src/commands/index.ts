@@ -85,6 +85,8 @@ import { extractMeetingNo } from '../meeting/api';
 import { answerInMeeting, meetingScopeId } from '../meeting/orchestrator';
 import { meetingAuthzSummary } from '../meeting/authz';
 import type { MeetingSession } from '../meeting/session';
+import { handleMeetingTodo } from '../meeting/minutes';
+import { handleMeetingDoc, parseDocLinks, replyMeetingDocs } from '../meeting/docs';
 import { hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 
 export interface Controls {
@@ -252,9 +254,31 @@ async function tryJoinFromMeetingCard(ctx: CommandContext, trimmed: string): Pro
   return true;
 }
 
+/**
+ * `会前资料 <doc link> [meeting no]` in a DM from an admin binds the doc like
+ * `/meeting doc`. Only at the start of the message: "帮我总结这份会议资料
+ * <link>" is a request for the agent, not a binding.
+ */
+async function tryBindMeetingDoc(ctx: CommandContext, trimmed: string): Promise<boolean> {
+  if (ctx.msg.chatType !== 'p2p') return false;
+  if (!trimmed.startsWith('会前资料')) return false;
+  if (parseDocLinks(trimmed).length === 0) return false;
+  if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) return false;
+  const manager = ctx.controls.meeting;
+  if (!ctx.controls.profileConfig.meeting.enabled || !manager) return false;
+  log.info('meeting', 'doc-intercept', { sender: ctx.msg.senderId.slice(-6) });
+  try {
+    await handleMeeting(`doc ${trimmed.slice('会前资料'.length).trim()}`, ctx);
+  } catch (err) {
+    log.fail('command', err, { cmd: '/meeting', via: 'doc-intercept' });
+  }
+  return true;
+}
+
 export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const trimmed = ctx.msg.content.trim();
   if (await tryJoinFromMeetingCard(ctx, trimmed)) return true;
+  if (await tryBindMeetingDoc(ctx, trimmed)) return true;
   if (!trimmed.startsWith('/')) return false;
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0] ?? '';
@@ -2229,6 +2253,32 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
       await reply(ctx, stopped ? '✅ 已中断该会议的当前任务。' : '该会议当前没有正在执行的任务。');
       return;
     }
+    case 'todo': {
+      // The "派成工单" button on the minutes card lands here (admin-gated as /meeting).
+      await handleMeetingTodo(
+        { controls: ctx.controls, channel: ctx.channel, chatId: ctx.msg.chatId, senderId: ctx.msg.senderId },
+        rest,
+        (md) => reply(ctx, md),
+      );
+      return;
+    }
+    case 'doc': {
+      await handleMeetingDoc(
+        {
+          controls: ctx.controls,
+          channel: ctx.channel,
+          chatId: ctx.msg.chatId,
+          senderId: ctx.msg.senderId,
+          sessions: () => manager.all(),
+        },
+        rest,
+        (md) => reply(ctx, md),
+      );
+      return;
+    }
+    case 'docs':
+      await replyMeetingDocs({ controls: ctx.controls, sessions: () => manager.all() }, (md) => reply(ctx, md));
+      return;
     case 'notes':
     case 'ask': {
       // `notes` takes an optional meeting number; `ask` takes the question, so
@@ -2287,6 +2337,9 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
           '`/meeting stop [会议号]` — 中断该会议卡住的任务',
           '`/meeting transcript [会议号]` — 看 agent 实际拿到的字幕和弹幕上下文',
           '`/meeting ask <问题>` — 带会议上下文提问',
+          '`/meeting doc <飞书文档链接> [会议号]` — 绑定会前资料（也可以直接发「会前资料 <链接>」）',
+          '`/meeting docs` — 看各场会绑定了哪些资料、哪个版本',
+          '`/meeting doc clear [会议号]` — 清空资料绑定',
         ].join('\n'),
       );
   }

@@ -111,9 +111,10 @@ function deps(
       session,
       channel: {
         botIdentity: { name: 'bot' },
-        send: vi.fn(async (to: string, input: { markdown: string }) => {
+        // Cards are recorded as their JSON so text assertions still apply.
+        send: vi.fn(async (to: string, input: { markdown?: string; card?: object }) => {
           if (to === opts.failTo) throw new Error('chat disbanded');
-          sent.push({ to, markdown: input.markdown });
+          sent.push({ to, markdown: input.markdown ?? JSON.stringify(input.card) });
           return {} as never;
         }),
       },
@@ -404,7 +405,9 @@ describe('failures reach a human', () => {
     });
     const d = deps(s, config);
     await answerInMeeting(d.args, '问题', { deliver: 'broadcast' });
-    expect(d.sent).toEqual([{ to: 'oc_team', markdown: '结论：周五上线。' }]);
+    expect(d.sent).toHaveLength(1);
+    expect(d.sent[0]!.to).toBe('oc_team');
+    expect(d.sent[0]!.markdown).toContain('结论：周五上线。');
   });
 
   it('tells the owner once when polling keeps failing, and re-arms after a success', async () => {

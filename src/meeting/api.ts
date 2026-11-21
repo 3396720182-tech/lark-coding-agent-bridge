@@ -89,7 +89,7 @@ function asVcApiError(err: unknown, endpoint: string): VcApiError | undefined {
   return new VcApiError(code, status ? `${msg}（HTTP ${status}）` : msg, endpoint);
 }
 
-async function call<T>(
+export async function call<T>(
   client: VcRequestClient,
   payload: { method: string; url: string; data?: unknown; params?: Record<string, unknown> },
 ): Promise<T> {

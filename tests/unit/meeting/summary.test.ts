@@ -112,8 +112,9 @@ describe('summarizeEndedMeeting', () => {
     expect(mocks.startRunFlow).toHaveBeenCalledTimes(1);
     expect(d.sent).toHaveLength(1);
     expect(d.sent[0]?.to).toBe('oc_team');
-    expect(String((d.sent[0]?.input as { markdown: string }).markdown)).toContain('会议纪要 · 周会');
-    expect(String((d.sent[0]?.input as { markdown: string }).markdown)).toContain('周五上线');
+    const card = JSON.stringify((d.sent[0]?.input as { card: object }).card);
+    expect(card).toContain('会议纪要 · 周会');
+    expect(card).toContain('周五上线');
   });
 
   it('falls back to the bot owner DM when there is no origin chat (console join)', async () => {

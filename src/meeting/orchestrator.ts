@@ -15,6 +15,28 @@ import { meetingAuthzGate, meetingEffectiveAccess, meetingReadOnlyAccess } from 
 import type { MeetingSession } from './session';
 import type { AccessMode, MeetingSummaryTarget } from '../config/profile-schema';
 import type { ChatEvent, MeetingEvent } from './types';
+import {
+  adoptPendingDocsOnJoin,
+  attachShareDocs,
+  docCitations,
+  docLabel,
+  meetingDocContext,
+  meetingDocRefs,
+  recordMeetingQa,
+  releaseMeetingDocs,
+  sendAnswerToIm,
+  type DocRef,
+  type UsedChunk,
+} from './docs';
+import {
+  MEETING_MINUTES_QUESTION,
+  meetingArchiveFile,
+  meetingArchiveId,
+  meetingMinutesCard,
+  splitMinutesTodos,
+  type MinutesRecord,
+} from './minutes';
+import { meetingDataDir, writeMeetingJson } from './store';
 
 /**
  * Turns in-meeting content into agent runs.
@@ -217,6 +239,10 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
   });
   // Additional subscriber: session.on keeps a Set per kind.
   attachMeetingAlerts(deps);
+  // Pre-meeting docs: take the ones waiting for this meeting, and bind docs
+  // shared on screen in the meeting.
+  adoptPendingDocsOnJoin(deps);
+  attachShareDocs(deps);
 }
 
 export interface AnswerOptions {
@@ -239,6 +265,11 @@ export interface AnswerOptions {
    * end-of-meeting summary stay read-only (summarizing needs no writes).
    */
   elevate?: boolean;
+  /**
+   * `minutes`: the end-of-meeting summary. Not bound by the in-meeting length
+   * limit, given the doc list instead of doc chunks, and not logged as Q&A.
+   */
+  purpose?: 'minutes';
 }
 
 /**
@@ -253,11 +284,14 @@ export async function answerInMeeting(
   const { session, controls } = deps;
   const config = controls.profileConfig.meeting;
   const transcript = session.recentContext(config.transcript.keep);
+  const docs = meetingDocContext(deps, question, transcript, opts.purpose);
   const prompt = buildMeetingPrompt({
     question,
     transcript,
     topic: session.topic,
     ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
+    ...(opts.purpose ? { purpose: opts.purpose } : {}),
+    ...docs.prompt,
   });
 
   // In-meeting chat runs at the meeting tier (or elevated); everything else
@@ -268,6 +302,19 @@ export async function answerInMeeting(
       : meetingReadOnlyAccess(controls.profileConfig);
   const answer = await runMeetingAgent(deps, prompt, opts.usedPrefix, opts.elevate === true, tier);
   if (!answer) return '';
+  // Which of the provided chunks the answer actually cites — those are its
+  // grounds; citations matching nothing provided are logged as unverified.
+  const { cited, unverified } = docCitations(answer, docs.used);
+  if (opts.purpose !== 'minutes') {
+    recordMeetingQa(deps, {
+      question,
+      answer,
+      ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
+      provided: docs.used,
+      cited,
+      unverified,
+    });
+  }
   // The caller relays it themselves; never echo into the meeting.
   if (opts.deliver === 'caller') return answer;
 
@@ -289,9 +336,9 @@ export async function answerInMeeting(
     });
   }
   if ((target === 'im' || target === 'both') && session.originChatId) {
-    await deps.channel
-      .send(session.originChatId, { markdown: answer })
-      .catch((err) => log.warn('meeting', 'send-im-failed', { err: String(err) }));
+    await sendAnswerToIm(deps, session.originChatId, question, answer, opts.askedBy, cited).catch((err) =>
+      log.warn('meeting', 'send-im-failed', { err: String(err) }),
+    );
   }
   return answer;
 }
@@ -301,6 +348,11 @@ export interface MeetingPromptInput {
   transcript: string[];
   topic?: string;
   askedBy?: string;
+  purpose?: 'minutes';
+  /** Doc chunks picked for this question, each shown with its citation. */
+  materials?: UsedChunk[];
+  /** Docs bound to the meeting (listed when no chunk matched, and for minutes). */
+  materialList?: DocRef[];
 }
 
 /** Compose the agent prompt: meeting context first, then the actual ask. */
@@ -312,6 +364,17 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
   parts.push('=== 会议记录（按时间顺序，可能不完整） ===');
   parts.push(input.transcript.length ? input.transcript.join('\n') : '（暂无字幕和弹幕）');
   parts.push('=== 记录结束 ===');
+  if (input.materials?.length) {
+    parts.push('');
+    parts.push('=== 会前资料（按和问题的相关度摘录，方括号里是出处） ===');
+    for (const m of input.materials) parts.push(`〔${docLabel(m.doc)} §${m.i}〕\n${m.text}`);
+    parts.push('=== 资料结束 ===');
+  } else if (input.materialList?.length) {
+    parts.push('');
+    parts.push(
+      `本场会议绑定的会前资料：${input.materialList.map(docLabel).join('、')}（这次没有摘到和问题相关的段落）`,
+    );
+  }
   parts.push('');
   parts.push(
     input.askedBy
@@ -320,9 +383,18 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
   );
   parts.push(input.question);
   parts.push('');
-  parts.push(
-    '请基于上面的会议上下文作答。回答会被发到会议里，请简洁（尽量 200 字内），不要用 markdown 标题。',
-  );
+  if (input.purpose === 'minutes') {
+    parts.push('这是会后纪要，会发到飞书聊天里，不受 200 字限制。小标题用加粗，不要用 # 标题。');
+  } else {
+    parts.push(
+      '请基于上面的会议上下文作答。回答会被发到会议里，请简洁（尽量 200 字内），不要用 markdown 标题。',
+    );
+  }
+  if (input.materials?.length) {
+    parts.push(
+      '用到会前资料时，在那句话后面照抄方括号里的出处，如〔《标题》r12 §3〕。资料和会议记录里都没有的，直接说不知道，不要编。',
+    );
+  }
   return parts.join('\n');
 }
 
@@ -365,6 +437,20 @@ export function notifyMeetingOwner(
  * bot. When there is nothing, or the run / delivery fails, the owner is told.
  */
 export async function summarizeEndedMeeting(deps: MeetingAgentDeps): Promise<void> {
+  try {
+    await summarize(deps);
+  } finally {
+    // The end of the meeting releases its doc bindings whether or not a
+    // summary went out (summary off, nothing heard, run failed). Snapshots stay.
+    try {
+      releaseMeetingDocs(meetingDataDir(deps.controls), deps.session.meetingId);
+    } catch (err) {
+      log.warn('meeting', 'docs-release-failed', { err: String(err) });
+    }
+  }
+}
+
+async function summarize(deps: MeetingAgentDeps): Promise<void> {
   const { session, controls } = deps;
   if (!controls.profileConfig.meeting.summaryOnEnd) return;
 
@@ -390,11 +476,10 @@ export async function summarizeEndedMeeting(deps: MeetingAgentDeps): Promise<voi
   }
 
   // deliver:'caller' — the meeting is over, so never try the in-meeting lane.
-  const answer = await answerInMeeting(
-    deps,
-    '会议已结束。请基于以上会议记录（字幕和弹幕）输出一份纪要：讨论了什么、达成的结论、待办（含负责人，如记录里有）。',
-    { deliver: 'caller' },
-  ).catch((err) => {
+  const answer = await answerInMeeting(deps, MEETING_MINUTES_QUESTION, {
+    deliver: 'caller',
+    purpose: 'minutes',
+  }).catch((err) => {
     log.warn('meeting', 'summary-run-failed', { meetingId: session.meetingId, err: String(err) });
     notifyMeetingOwner(deps, 'summary-run-failed', `会议已结束，但生成纪要失败：${String(err)}`);
     return '';
@@ -415,18 +500,7 @@ export async function summarizeEndedMeeting(deps: MeetingAgentDeps): Promise<voi
     });
     notes.push(`bridge 在 ${hhmm} 重启后接回本场会议，此前的部分内容可能缺失。`);
   }
-  const body =
-    `**会议纪要 · ${title}**\n\n${answer}` + (notes.length ? `\n\n> ${notes.join('\n> ')}` : '');
-  const sent = await deps.channel
-    .send(target.to, { markdown: body })
-    .then(() => true)
-    .catch((err) => {
-      log.warn('meeting', 'summary-send-failed', { err: String(err) });
-      if (target.to !== controls.botOwnerId) {
-        notifyMeetingOwner(deps, 'summary-send-failed', `纪要发到来源会话失败（${String(err)}），改发这里：\n\n${body}`);
-      }
-      return false;
-    });
+  const sent = await deliverMeetingMinutes(deps, target, answer, notes);
   if (!sent) return;
   log.info('meeting', 'summary-sent', {
     meetingId: session.meetingId,
@@ -435,6 +509,86 @@ export async function summarizeEndedMeeting(deps: MeetingAgentDeps): Promise<voi
     target: target.kind,
     fellBack: target.fellBack,
   });
+}
+
+/**
+ * Archive the minutes and send them as a card: prose, structured todos with a
+ * "派成工单" button each, notes and bound docs in the footer. When the card is
+ * rejected, the old markdown goes out instead. The archive holds minutes and
+ * todos only, never transcript or chat text; failing to write it never blocks
+ * the minutes (the card then has no buttons). Returns whether anything was sent.
+ */
+async function deliverMeetingMinutes(
+  deps: MeetingAgentDeps,
+  target: ResolvedSummaryTarget,
+  answer: string,
+  notes: string[],
+): Promise<boolean> {
+  const { session, controls } = deps;
+  const title = session.topic ?? session.meetingNo;
+  const split = splitMinutesTodos(answer);
+  let dir: string | undefined;
+  try {
+    dir = meetingDataDir(controls);
+  } catch (err) {
+    log.warn('meeting', 'data-dir-failed', { err: String(err) });
+  }
+  let docs: DocRef[] = [];
+  try {
+    if (dir) docs = meetingDocRefs(dir, session.meetingId);
+  } catch (err) {
+    log.warn('meeting', 'doc-context-failed', { meetingId: session.meetingId, err: String(err) });
+  }
+  const rec: MinutesRecord = {
+    id: meetingArchiveId(session.meetingNo),
+    meetingId: session.meetingId,
+    meetingNo: session.meetingNo,
+    ...(session.topic ? { topic: session.topic } : {}),
+    endedAt: new Date().toISOString(),
+    ...(session.originChatId ? { originChatId: session.originChatId } : {}),
+    minutes: split.minutes,
+    todosParsed: split.parsed,
+    todos: split.todos,
+    docs,
+  };
+  let archived = false;
+  if (dir) {
+    try {
+      writeMeetingJson(meetingArchiveFile(dir, rec.id), rec);
+      archived = true;
+    } catch (err) {
+      log.warn('meeting', 'archive-failed', { err: String(err) });
+    }
+  }
+  const body =
+    `**会议纪要 · ${title}**\n\n${answer}` + (notes.length ? `\n\n> ${notes.join('\n> ')}` : '');
+  let via: 'card' | 'markdown' = 'card';
+  const sent = await deps.channel
+    .send(target.to, { card: meetingMinutesCard(rec, notes, archived) })
+    .then(() => true)
+    .catch(async (cardErr) => {
+      log.warn('meeting', 'minutes-card-failed', { err: String(cardErr) });
+      via = 'markdown';
+      return deps.channel
+        .send(target.to, { markdown: body })
+        .then(() => true)
+        .catch((err) => {
+          log.warn('meeting', 'summary-send-failed', { err: String(err) });
+          if (target.to !== controls.botOwnerId) {
+            notifyMeetingOwner(deps, 'summary-send-failed', `纪要发到来源会话失败（${String(err)}），改发这里：\n\n${body}`);
+          }
+          return false;
+        });
+    });
+  log.info('meeting', 'minutes-archived', {
+    meetingId: session.meetingId,
+    archive: archived ? rec.id : null,
+    todos: rec.todos.length,
+    parsed: split.parsed,
+    via,
+    sent,
+  });
+  return sent;
 }
 
 export interface ResolvedSummaryTarget {
