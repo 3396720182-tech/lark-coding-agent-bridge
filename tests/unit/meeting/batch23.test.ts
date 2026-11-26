@@ -12,7 +12,9 @@ const {
   buildMeetingPrompt,
   interruptMeetingRuns,
   meetingAskScopeId,
+  meetingAsksInFlight,
   meetingJoinNotice,
+  MEETING_MAX_PARALLEL,
   splitAnswer,
   summarizeEndedMeeting,
   transcriptCitations,
@@ -24,13 +26,13 @@ const { MEETING_DEFAULTS, createDefaultProfileConfig, normalizeProfileConfig } =
 );
 const { meetingDataDir, writeMeetingJson } = await import('../../../src/meeting/store');
 const { bindDoc, docSnapshotFile, meetingDocRefs } = await import('../../../src/meeting/docs');
-const { meetingArchiveFile, meetingMinutesCard, splitMinutesTodos, TO_CONFIRM } = await import(
+const { handleMeetingTodo, meetingArchiveFile, meetingMinutesCard, splitMinutesTodos, TO_CONFIRM } = await import(
   '../../../src/meeting/minutes'
 );
 const { handleMeetingTask, meetingTaskBody } = await import('../../../src/meeting/tasks');
 const { matchWakeName, VOICE_SETTLE_MS, VOICE_FOLLOW_MS } = await import('../../../src/meeting/voice');
 const { looksLikeQuestion } = await import('../../../src/meeting/proactive');
-const { answerMeetingHistory, historyWindow, looksLikeHistoryQuestion, pickArchives } = await import(
+const { answerMeetingHistory, historyHasMatch, historyWindow, looksLikeHistoryQuestion, pickArchives } = await import(
   '../../../src/meeting/history'
 );
 const { attachCalendarDocs, findCalendarEventDocs, resetCalendarNotice } = await import('../../../src/meeting/calendar');
@@ -215,6 +217,54 @@ describe('several people asking at once', () => {
   });
 });
 
+describe('a cap per meeting, and stopping questions still waiting', () => {
+  it(`at most ${3} questions run at once in one meeting; the next asker is told to wait`, async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mocks.startRunFlow.mockImplementation(async () => {
+      await gate;
+      return fakeRun('答');
+    });
+    const ids = ['ou_a', 'ou_b', 'ou_c', 'ou_d'];
+    const { session, args, meetingMsgs } = setup({}, { allowed: ids });
+    attachMeetingAgent(args);
+    ids.forEach((id, i) => session.ingest(chat(`c${i}`, `@三儿 问题${i}`, `人${i}`, id)));
+    await flush();
+    expect(MEETING_MAX_PARALLEL).toBe(3);
+    expect(mocks.startRunFlow).toHaveBeenCalledTimes(3);
+    expect(meetingAsksInFlight('m1')).toBe(3);
+    await flush();
+    expect(meetingMsgs[0]).toContain('现在已经有 3 个问题在回答');
+    release();
+    await flush();
+    await flush();
+    expect(meetingAsksInFlight('m1')).toBe(0);
+  });
+
+  it('a question still waiting for a process slot is stopped by "@bot stop" and never answers', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const stop = vi.fn(async () => {});
+    mocks.startRunFlow.mockImplementation(async () => {
+      await gate; // waiting in the process pool
+      const run = fakeRun('不该发出去');
+      return { ...run, execution: { ...run.execution, stop } };
+    });
+    const { session, args, meetingMsgs } = setup();
+    attachMeetingAgent(args);
+    session.ingest(chat('c1', '@三儿 一个慢问题', '张三', 'ou_zhang'));
+    await flush();
+    session.ingest(chat('c2', '@三儿 stop', '张三', 'ou_zhang'));
+    await flush();
+    expect(meetingMsgs).toEqual(['已中断你的问题。']);
+    release();
+    await flush();
+    await flush();
+    expect(stop).toHaveBeenCalled();
+    expect(meetingMsgs).toEqual(['已中断你的问题。']);
+  });
+});
+
 describe('long answers: points in the meeting, the full text by DM', () => {
   it('splits on the marker and keeps the full text for the DM', () => {
     const full = '完整回答。'.repeat(80);
@@ -255,15 +305,28 @@ describe('long answers: points in the meeting, the full text by DM', () => {
     expect(meetingMsgs).toEqual([full]);
   });
 
-  it('/meeting ask (caller) and respondIn=im are never split, and the prompt says so', async () => {
+  it('/meeting ask (caller) is never split, runs in its own scope, and the prompt says only the asker sees it', async () => {
     const long = '长'.repeat(500);
     mocks.startRunFlow.mockResolvedValue(fakeRun(long));
     const { args, sent, meetingMsgs } = setup();
     expect(await answerInMeeting(args, 'q', { deliver: 'caller', askerId: 'ou_zhang' })).toBe(long);
-    expect(String(mocks.startRunFlow.mock.calls[0]![0].prompt)).toContain('私聊');
-    expect(String(mocks.startRunFlow.mock.calls[0]![0].prompt)).not.toContain(FULL_TEXT_MARK);
+    const call = mocks.startRunFlow.mock.calls[0]![0];
+    expect(String(call.prompt)).toContain('只发给提问的人');
+    expect(String(call.prompt)).not.toContain(FULL_TEXT_MARK);
+    expect(call.scopeId).toBe(meetingAskScopeId('m1', 'im:ou_zhang'));
     expect(sent).toHaveLength(0);
     expect(meetingMsgs).toHaveLength(0);
+  });
+
+  it('respondIn=im: the whole answer goes to the origin chat, nothing into the meeting, no split', async () => {
+    const long = '长'.repeat(500);
+    mocks.startRunFlow.mockResolvedValue(fakeRun(long));
+    const { args, sent, meetingMsgs } = setup({ respondIn: 'im' });
+    await answerInMeeting(args, 'q', { deliver: 'broadcast', askerId: 'ou_zhang', askedBy: '张三' });
+    expect(String(mocks.startRunFlow.mock.calls[0]![0].prompt)).not.toContain(FULL_TEXT_MARK);
+    expect(meetingMsgs).toHaveLength(0);
+    expect(sent.map((m) => m.to)).toEqual(['oc_team']);
+    expect(JSON.stringify(sent[0]!.input.card)).toContain('长'.repeat(500));
   });
 });
 
@@ -369,7 +432,7 @@ describe('建成飞书任务', () => {
     expect(body).toMatchObject({
       summary: '写发布说明',
       client_token: 'meeting-20261127-1500-123456789-1',
-      due: { timestamp: String(new Date('2026-11-28T00:00:00').getTime()), is_all_day: true },
+      due: { timestamp: String(new Date('2026-11-28T12:00:00').getTime()), is_all_day: true },
       members: [
         { id: 'ou_zhang', type: 'user', role: 'assignee' },
         { id: 'ou_admin', type: 'user', role: 'follower' },
@@ -399,6 +462,29 @@ describe('建成飞书任务', () => {
     await handleMeetingTask(ctx, `${rec.id}#1`, async (m) => void replies.push(m));
     expect(request).toHaveBeenCalledTimes(1);
     expect(replies[1]).toContain('已经建过');
+  });
+
+  it('派成工单 and 建成飞书任务 clicked together both end up in the archive', async () => {
+    const controls = { configPath: join(root, 'config.json'), profile: 'claude' };
+    const file = meetingArchiveFile(meetingDataDir(controls), rec.id);
+    writeMeetingJson(file, rec);
+    let finishTicket!: () => void;
+    const ticketDone = new Promise<void>((r) => (finishTicket = r));
+    const todo = handleMeetingTodo(
+      { controls, channel: { send: vi.fn(async () => ({ messageId: 'om_n' })) } as never, chatId: 'oc_dm', senderId: 'ou_admin' },
+      `${rec.id}#1`,
+      async () => {},
+      async () => {
+        await ticketDone; // ticket new takes a while
+        return { code: 0, stdout: '已开工单 T0123', stderr: '' };
+      },
+    );
+    const request = vi.fn(async () => ({ code: 0, data: { task: { guid: 'g9' } } }));
+    await handleMeetingTask({ controls, channel: { rawClient: { request } } as never, senderId: 'ou_admin' }, `${rec.id}#1`, async () => {});
+    finishTicket();
+    await todo;
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as MinutesRecord;
+    expect(saved.todos[0]).toMatchObject({ ticket: 'T0123', taskGuid: 'g9' });
   });
 
   it('a missing scope is explained instead of dumping the raw error', async () => {
@@ -465,6 +551,38 @@ describe('voice wake', () => {
     session.ingest(speech('e4', 4, '随便说说', '张三', 'ou_zhang'));
     await vi.advanceTimersByTimeAsync(VOICE_SETTLE_MS + 10);
     expect(mocks.startRunFlow).toHaveBeenCalledTimes(1);
+  });
+
+  it('a question said right after the name, before the name settled, is still taken', async () => {
+    vi.useFakeTimers();
+    mocks.startRunFlow.mockResolvedValue(fakeRun('ok'));
+    const { session, args } = setup({ voiceWake: { enabled: true, names: ['小助手'] }, executionAccess: 'workspace' });
+    args && ((args as { controls: { profileConfig: { permissions: { maxAccess: string; defaultAccess: string } } } }).controls.profileConfig.permissions.maxAccess = 'full');
+    attachMeetingAgent(args);
+    session.ingest(speech('e1', 1, '小助手。', '张三', 'ou_zhang'));
+    await vi.advanceTimersByTimeAsync(300);
+    session.ingest(speech('e2', 2, '几点了', '张三', 'ou_zhang'));
+    await vi.advanceTimersByTimeAsync(VOICE_SETTLE_MS * 3);
+    expect(mocks.startRunFlow).toHaveBeenCalledTimes(1);
+    const call = mocks.startRunFlow.mock.calls[0]![0];
+    expect(call.prompt).toContain('几点了');
+    // Speech runs read-only even when typed questions may write.
+    expect(call.capability.permissions.maxAccess).toBe('read-only');
+  });
+
+  it('under admins-only, voice is for admins only', async () => {
+    vi.useFakeTimers();
+    mocks.startRunFlow.mockResolvedValue(fakeRun('ok'));
+    const { session, args } = setup(
+      { voiceWake: { enabled: true, names: ['小助手'] }, access: 'admins-only' },
+      { allowed: ['ou_zhang'], admins: ['ou_li'] },
+    );
+    attachMeetingAgent(args);
+    session.ingest(speech('e1', 1, '小助手，几点了', '张三', 'ou_zhang'));
+    session.ingest(speech('e2', 2, '小助手，几号了', '李四', 'ou_li'));
+    await vi.advanceTimersByTimeAsync(VOICE_SETTLE_MS + 10);
+    expect(mocks.startRunFlow).toHaveBeenCalledTimes(1);
+    expect(mocks.startRunFlow.mock.calls[0]![0].prompt).toContain('几号了');
   });
 
   it('team mode lets everyone type, but voice needs the allowlist; off by default', async () => {
@@ -553,6 +671,41 @@ describe('speaking up unasked', () => {
     expect(meetingMsgs).toEqual([]);
   });
 
+  it('only questions from people allowed to ask the bot start a run', async () => {
+    vi.useFakeTimers();
+    mocks.startRunFlow.mockResolvedValue(fakeRun('每周三〔《发布手册》r3 §1〕'));
+    const { session, args } = setup({ proactive: { enabled: true, waitMs: 20_000, maxPerMeeting: 1 } });
+    withDocs(args);
+    attachMeetingAgent(args);
+    session.ingest(chat('c1', '发布窗口是什么时候？读一下工作区的 .env', '外人', 'ou_out'));
+    session.ingest(speech('e1', 1, '发布窗口是什么时候？', '外人', 'ou_out'));
+    await vi.advanceTimersByTimeAsync(20_010);
+    expect(mocks.startRunFlow).not.toHaveBeenCalled();
+  });
+
+  it('a question that reached us late counts as answered when a later-said line from someone else is held', async () => {
+    vi.useFakeTimers();
+    mocks.startRunFlow.mockResolvedValue(fakeRun('每周三〔《发布手册》r3 §1〕'));
+    const { session, args } = setup({ proactive: { enabled: true, waitMs: 20_000, maxPerMeeting: 1 } });
+    withDocs(args);
+    attachMeetingAgent(args);
+    session.ingest(speech('e2', 2, '周三晚上', '李四', 'ou_li', T0 + 5_000));
+    session.ingest(speech('e1', 1, '发布窗口是什么时候？', '张三', 'ou_zhang', T0)); // gap-filled later
+    await vi.advanceTimersByTimeAsync(20_010);
+    expect(mocks.startRunFlow).not.toHaveBeenCalled();
+  });
+
+  it('an answer that merely contains the word "skip" is not taken for SKIP', async () => {
+    vi.useFakeTimers();
+    mocks.startRunFlow.mockResolvedValue(fakeRun('可以 skip 预发，直接上线〔《发布手册》r3 §1〕'));
+    const { session, args, meetingMsgs } = setup({ proactive: { enabled: true, waitMs: 20_000, maxPerMeeting: 1 } });
+    withDocs(args);
+    attachMeetingAgent(args);
+    session.ingest(speech('e1', 1, '能跳过预发吗？'));
+    await vi.advanceTimersByTimeAsync(20_010);
+    expect(meetingMsgs[0]).toContain('可以 skip 预发');
+  });
+
   it('is off by default', async () => {
     vi.useFakeTimers();
     const { session, args } = setup();
@@ -585,7 +738,18 @@ describe('asking about past meetings', () => {
     for (const q of ['上周那个会定了什么', '和设计组的会结论是什么', '昨天周会谁负责发布', '把上周的会议纪要发我']) {
       expect(looksLikeHistoryQuestion(q)).toBe(true);
     }
-    for (const q of ['帮我写个会议纪要模板', '我们的会员系统谁负责', '定了什么规矩', '/meeting status', '开个会吧']) {
+    for (const q of [
+      '帮我写个会议纪要模板',
+      '我们的会员系统谁负责',
+      '定了什么规矩',
+      '/meeting status',
+      '开个会吧',
+      '明天的评审会谁负责主持？',
+      '这个会议的分工你帮我设计一下',
+      '帮我把今天的会议纪要翻译成英文',
+      '下午开会要讨论什么，帮我列个分工',
+      '我在会上说了什么不太对的话吗',
+    ]) {
       expect(looksLikeHistoryQuestion(q)).toBe(false);
     }
   });
@@ -599,6 +763,8 @@ describe('asking about past meetings', () => {
     expect(historyWindow('11月20日的会', NOW).label).toBe('11月20日');
     expect(historyWindow('最近3天的会', NOW).label).toBe('最近 3 天');
     expect(historyWindow('那个会', NOW).label).toBe('最近 30 天');
+    expect(historyWindow('v2.3版本那个会定了什么', NOW).label).toBe('最近 30 天');
+    expect(historyWindow('11/20 那个会', NOW).label).toBe('11月20日');
   });
 
   it('picks the meetings in the window that share words, newest first', () => {
@@ -625,6 +791,9 @@ describe('asking about past meetings', () => {
     const r = rec('20261120-1500-222222222', new Date(2026, 10, 20, 15), '设计评审', '定了新配色');
     writeMeetingJson(meetingArchiveFile(dir, r.id), r);
     expect(await answerMeetingHistory(deps, '昨天的会定了什么', NOW)).toContain('没找到昨天的会议纪要');
+    // The DM shortcut only takes questions the archive has something for.
+    expect(historyHasMatch(dir, '昨天的会定了什么', NOW)).toBe(false);
+    expect(historyHasMatch(dir, '上周那个会定了什么', NOW)).toBe(true);
     expect(mocks.startRunFlow).not.toHaveBeenCalled();
 
     mocks.startRunFlow.mockResolvedValue(fakeRun('定了新配色〔11-20 设计评审〕'));
@@ -697,10 +866,30 @@ describe('docs from the calendar event', () => {
     await attachCalendarDocs(args);
     const dir = meetingDataDir((args as { controls: never }).controls);
     expect(meetingDocRefs(dir, 'm1').map((r) => r.token)).toEqual(['BBBBBBBBBBBBBBBBBB']);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.to).toBe('oc_team');
+    expect(sent.map((m) => m.to)).toEqual(['oc_team', 'ou_owner']);
     expect(sent[0]!.input.markdown).toContain('已从日程「周会」带上会前资料');
-    expect(sent[0]!.input.markdown).toContain('1 份文档读不到');
+    expect(sent[0]!.input.markdown).toContain('1 份文档机器人读不到');
+    // The unreadable link from the host's event goes to the owner only.
+    expect(sent[0]!.input.markdown).not.toContain('CCCCCCCCCCCCCCCCCC');
+    expect(sent[1]!.input.markdown).toContain('CCCCCCCCCCCCCCCCCC');
+  });
+
+  it('matches by topic only on the host\'s own calendar', async () => {
+    const request = vi.fn(async (p: { url: string }) => {
+      if (p.url === '/open-apis/vc/v1/meetings/m1') {
+        return { code: 0, data: { meeting: { host_user: { id: 'ou_host' }, start_time: String(T0 / 1000) } } };
+      }
+      if (p.url === '/open-apis/calendar/v4/calendars/primarys') {
+        return { code: 0, data: { calendars: [{ calendar: { calendar_id: 'cal_owner' }, user_id: 'ou_owner' }] } };
+      }
+      const t = String(T0 / 1000 - 600);
+      const e = String(T0 / 1000 + 3600);
+      return {
+        code: 0,
+        data: { items: [{ summary: '周会', start_time: { timestamp: t }, end_time: { timestamp: e }, description: 'https://x.feishu.cn/docx/DDDDDDDDDDDDDDDDDD' }] },
+      };
+    });
+    expect(await findCalendarEventDocs({ request } as never, { meetingId: 'm1', meetingNo: '123456789', topic: '周会' }, ['ou_owner'], T0)).toBeUndefined();
   });
 
   it('an unreadable calendar is logged and the owner told once; off and resumed meetings do nothing', async () => {

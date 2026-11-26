@@ -1,8 +1,15 @@
 import type { LarkChannel } from '@larksuite/channel';
 import { log } from '../core/logger';
 import { call, VcApiError, type VcRequestClient } from './api';
-import { meetingArchiveFile, TO_CONFIRM, todoWhoWhen, type MeetingTodo, type MinutesRecord } from './minutes';
-import { meetingDataDir, readMeetingJson, writeMeetingJson } from './store';
+import {
+  meetingArchiveFile,
+  patchArchiveTodo,
+  TO_CONFIRM,
+  todoWhoWhen,
+  type MeetingTodo,
+  type MinutesRecord,
+} from './minutes';
+import { meetingDataDir, readMeetingJson } from './store';
 
 /**
  * "建成飞书任务" on the minutes card: one todo → one Feishu task (task v2),
@@ -50,7 +57,8 @@ export function meetingTaskBody(
     // Same todo, same task: a second click (or a retry after a timeout) does not make another.
     client_token: `meeting-${rec.id}-${index}`,
     ...(todo.dueDate
-      ? { due: { timestamp: String(new Date(`${todo.dueDate}T00:00:00`).getTime()), is_all_day: true } }
+      ? // Local noon: the same calendar day whether Feishu reads the date part in UTC or in the tenant's zone.
+        { due: { timestamp: String(new Date(`${todo.dueDate}T12:00:00`).getTime()), is_all_day: true } }
       : {}),
     ...(members.length ? { members } : {}),
   };
@@ -119,7 +127,12 @@ export async function handleMeetingTask(
     if (task.url) todo.taskUrl = task.url;
     todo.taskAt = new Date().toISOString();
     try {
-      writeMeetingJson(file, rec);
+      // Re-read and change only this todo's task fields: 派成工单 may have written meanwhile.
+      patchArchiveTodo(file, index, {
+        taskGuid: task.guid,
+        ...(task.url ? { taskUrl: task.url } : {}),
+        taskAt: todo.taskAt,
+      });
     } catch (err) {
       // The task exists; the client_token stops a second click from making another.
       log.warn('meeting', 'task-record-failed', { archive: archiveId, err: String(err) });

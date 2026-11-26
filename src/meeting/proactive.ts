@@ -1,5 +1,6 @@
 import { log } from '../core/logger';
 import type { ProfileConfig } from '../config/profile-schema';
+import { canRunAdminCommand, canUseDm, type RuntimeControls } from '../policy/access';
 import { docCitations, docLabel, meetingDocContext, recordMeetingQa, type UsedChunk } from './docs';
 import type { MeetingSession } from './session';
 import type { ChatEvent, TranscriptEvent } from './types';
@@ -57,9 +58,23 @@ export function buildProactivePrompt(input: {
   ].join('\n');
 }
 
+/**
+ * Only questions from people who may ask the bot anyway (the in-meeting gate:
+ * DM policy, or admins under `admins-only`) are considered. Anyone else's
+ * words would otherwise start a run whose prompt they wrote. Silent.
+ */
+export function proactiveAskerAllowed(
+  controls: RuntimeControls & { profileConfig: ProfileConfig },
+  id: string | undefined,
+): boolean {
+  if (!id) return false;
+  const p = controls.profileConfig;
+  return (p.meeting.access === 'admins-only' ? canRunAdminCommand(p, controls, id) : canUseDm(p, controls, id)).ok;
+}
+
 export interface ProactiveDeps {
   session: MeetingSession;
-  controls: { configPath: string; profile: string; profileConfig: ProfileConfig };
+  controls: RuntimeControls & { configPath: string; profile: string; profileConfig: ProfileConfig };
   /** Is this chat message addressed to the bot (`@bot …`)? Those are answered anyway. */
   addressedToBot: (text: string) => boolean;
   /** The bot's own open_id: its own messages are never questions. */
@@ -73,6 +88,7 @@ interface Candidate {
   askedBy?: string;
   askerKey: string;
   seq: number;
+  at?: number;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -85,16 +101,16 @@ export function attachProactive(deps: ProactiveDeps): () => void {
   let busy = false;
 
   /** Did anyone other than the asker say something after `seq`? */
-  const answeredSince = (seq: number, askerKey: string): boolean =>
+  const answeredSince = (c: Pick<Candidate, 'seq' | 'at' | 'askerKey'>): boolean =>
     session
-      .linesAfter(seq)
-      .some((l) => (l.speakerId ?? l.speaker) !== askerKey && l.text.replace(/[\s,，、。.!！?？~～]/g, '').length >= 2);
+      .linesAfter(c.seq, c.at)
+      .some((l) => (l.speakerId ?? l.speaker) !== c.askerKey && l.text.replace(/[\s,，、。.!！?？~～]/g, '').length >= 2);
 
   const check = async (key: string): Promise<void> => {
     const c = pending.get(key);
     pending.delete(key);
     if (!c || session.ended || busy || spoken >= cfg().maxPerMeeting || !cfg().enabled) return;
-    if (answeredSince(c.seq, c.askerKey)) return;
+    if (answeredSince(c)) return;
     const docs = meetingDocContext(deps, c.question, []);
     if (docs.used.length === 0) return;
     busy = true;
@@ -107,7 +123,7 @@ export function attachProactive(deps: ProactiveDeps): () => void {
         recent,
         materials: docs.used,
       }))).trim();
-      if (!raw || raw.length < MIN_ANSWER_LEN || raw.toUpperCase().includes(PROACTIVE_SKIP)) {
+      if (!raw || raw.length < MIN_ANSWER_LEN || /^[\s"'`*「『【(（]*SKIP\b/i.test(raw) || raw.toUpperCase() === PROACTIVE_SKIP) {
         log.info('meeting', 'proactive-skip', { meetingId: session.meetingId, reason: raw ? 'model' : 'no-run' });
         return;
       }
@@ -117,7 +133,7 @@ export function attachProactive(deps: ProactiveDeps): () => void {
         return;
       }
       // Somebody answered while the run was going: the moment has passed.
-      if (session.ended || answeredSince(c.seq, c.askerKey) || spoken >= cfg().maxPerMeeting) return;
+      if (session.ended || answeredSince(c) || spoken >= cfg().maxPerMeeting) return;
       const answer = raw.length > MAX_ANSWER_CHARS ? `${raw.slice(0, MAX_ANSWER_CHARS)}…` : raw;
       spoken += 1;
       await session.sendMessage(`💡 刚才${c.askedBy ? ` ${c.askedBy} ` : ''}问「${c.question.slice(0, 40)}」，会前资料里有：${answer}`);
@@ -143,22 +159,33 @@ export function attachProactive(deps: ProactiveDeps): () => void {
     if (prior) clearTimeout(prior.timer);
     pending.delete(key);
     if (!cfg().enabled || spoken >= cfg().maxPerMeeting || seq === undefined || !looksLikeQuestion(question)) return;
+    if (!proactiveAskerAllowed(controls, askerKey)) return;
+    const at = session.atOf(seq);
     const timer = setTimeout(() => void check(key), cfg().waitMs);
     timer.unref?.();
-    pending.set(key, { question: question.trim(), askerKey, seq, timer, ...(askedBy ? { askedBy } : {}) });
+    pending.set(key, {
+      question: question.trim(),
+      askerKey,
+      seq,
+      timer,
+      ...(at !== undefined ? { at } : {}),
+      ...(askedBy ? { askedBy } : {}),
+    });
   };
 
   const offSpeech = session.on('transcript', (e) => {
     const t = e as TranscriptEvent;
     if (t.selfEcho) return;
-    consider(`s:${t.sentenceId}`, t.text, t.speaker.id ?? t.speaker.name ?? '?', session.seqOf(t.sentenceId), t.speaker.name);
+    if (!t.speaker.id) return; // no id, no way to tell who asked
+    consider(`s:${t.sentenceId}`, t.text, t.speaker.id, session.seqOf(t.sentenceId), t.speaker.name);
   });
   const offChat = session.on('chat', (e) => {
     const c = e as ChatEvent;
     if (c.messageType === 3 || deps.addressedToBot(c.content)) return;
     const self = deps.selfId();
     if (self && c.from.id === self) return;
-    consider(`c:${session.lastSeq()}`, c.content, c.from.id ?? c.from.name ?? '?', session.lastSeq(), c.from.name);
+    if (!c.from.id) return;
+    consider(`c:${session.lastSeq()}`, c.content, c.from.id, session.lastSeq(), c.from.name);
   });
 
   return () => {

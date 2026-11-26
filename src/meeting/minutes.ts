@@ -310,6 +310,19 @@ export const runTicketNew: TicketNewRunner = async (input) => {
   }
 };
 
+/**
+ * Set fields on one todo of an archive, reading the file fresh: the two card
+ * buttons (ticket, Feishu task) run independently and each takes seconds, so
+ * writing back an earlier copy would drop what the other one recorded.
+ */
+export function patchArchiveTodo(file: string, index: number, patch: Partial<MeetingTodo>): void {
+  const rec = readMeetingJson<MinutesRecord | null>(file, null);
+  const todo = rec?.todos?.[index - 1];
+  if (!rec || !todo) throw new Error(`archive todo ${index} not found`);
+  Object.assign(todo, patch);
+  writeMeetingJson(file, rec);
+}
+
 const inflight = new Set<string>();
 
 export interface MeetingTodoContext {
@@ -374,7 +387,7 @@ export async function handleMeetingTodo(
     if (out.code === 0 && ticketId) {
       todo.ticket = ticketId;
       todo.ticketAt = new Date().toISOString();
-      writeMeetingJson(file, rec);
+      patchArchiveTodo(file, index, { ticket: ticketId, ticketAt: todo.ticketAt });
     }
     log.info('meeting', 'todo-dispatched', { archive: archiveId, index, ticket: ticketId ?? null, code: out.code });
     await reply(

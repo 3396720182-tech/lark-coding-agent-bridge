@@ -81,25 +81,53 @@ export function meetingAskScopeId(meetingId: string, askerId: string): string {
 }
 
 /**
+ * In-meeting questions running (or waiting for a process slot) at once, per
+ * meeting. Without a cap, a crowd asking together — in team mode anyone in the
+ * meeting may — would take every agent process the bridge has.
+ */
+export const MEETING_MAX_PARALLEL = 3;
+
+/** meetingId → scope → state of each in-meeting question run, from submit until it finishes. */
+const askRuns = new Map<string, Map<string, { cancelled: boolean }>>();
+
+/** Questions of this meeting in flight (for tests and status). */
+export function meetingAsksInFlight(meetingId: string): number {
+  return askRuns.get(meetingId)?.size ?? 0;
+}
+
+/**
  * Stop a meeting's runs: one asker's (`askerId`), or every question run of
- * the meeting (`/meeting stop`). The minutes run is never touched. Returns how
- * many were stopped.
+ * the meeting (`/meeting stop`). The minutes run is never touched. A question
+ * still waiting for a process slot is cancelled too (it stops as soon as it
+ * starts). Returns how many were stopped.
  */
 export function interruptMeetingRuns(
   activeRuns: Pick<ActiveRuns, 'interrupt'> & Partial<Pick<ActiveRuns, 'scopes'>>,
   meetingId: string,
   askerId?: string,
 ): number {
-  if (askerId) return activeRuns.interrupt(meetingAskScopeId(meetingId, askerId)) ? 1 : 0;
+  const tracked = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
+  const stopped = new Set<string>();
+  const stop = (scope: string) => {
+    if (activeRuns.interrupt(scope)) stopped.add(scope);
+    const pending = tracked.get(scope);
+    if (pending && !pending.cancelled) {
+      pending.cancelled = true;
+      stopped.add(scope);
+    }
+  };
+  if (askerId) {
+    stop(meetingAskScopeId(meetingId, askerId));
+    return stopped.size;
+  }
   const base = meetingScopeId(meetingId);
   const minutes = meetingMinutesScopeId(meetingId);
-  const scopes = activeRuns.scopes?.() ?? [base];
-  let n = 0;
+  const scopes = new Set([...(activeRuns.scopes?.() ?? [base]), ...tracked.keys()]);
   for (const scope of scopes) {
     if (scope === minutes || (scope !== base && !scope.startsWith(`${base}:`))) continue;
-    if (activeRuns.interrupt(scope)) n += 1;
+    stop(scope);
   }
-  return n;
+  return stopped.size;
 }
 
 /**
@@ -305,7 +333,8 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
     addressedToBot: (text) =>
       matchTrigger(text, triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)) !==
       undefined,
-    run: (prompt) => runReadOnlyPrompt(deps, prompt, `${meetingScopeId(session.meetingId)}:proactive`),
+    run: (prompt) =>
+      runReadOnlyPrompt(deps, prompt, `${meetingScopeId(session.meetingId)}:proactive`).then((r) => r.text),
   });
 }
 
@@ -442,8 +471,9 @@ export async function answerInMeeting(
 
   // In-meeting chat runs at the meeting tier (or elevated); everything else
   // (`/meeting ask|notes`, the summary) is read-only: its input is meeting content.
+  // Spoken questions stay read-only too: their text is whatever speech recognition heard.
   const tier =
-    opts.deliver === 'broadcast'
+    opts.deliver === 'broadcast' && opts.via !== 'voice'
       ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
       : meetingReadOnlyAccess(controls.profileConfig);
   const raw = await runMeetingAgent(deps, prompt, {
@@ -452,7 +482,10 @@ export async function answerInMeeting(
     tier,
     ...(opts.purpose === 'minutes'
       ? { minutes: true }
-      : { scopeId: meetingAskScopeId(session.meetingId, opts.askerId ?? 'im') }),
+      : opts.deliver === 'broadcast'
+        ? { scopeId: meetingAskScopeId(session.meetingId, opts.askerId ?? '?'), track: true }
+        : // `/meeting ask` from a chat: its own scope, not the asker's in-meeting one.
+          { scopeId: meetingAskScopeId(session.meetingId, `im:${opts.askerId ?? '?'}`) }),
   });
   if (!raw) return '';
   if (opts.purpose === 'minutes') return raw;
@@ -649,7 +682,7 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
     return parts.join('\n');
   }
   if (input.lane === 'private') {
-    parts.push('请基于上面的会议上下文作答。回答只发给提问人（私聊），可以完整作答，不要用 markdown 标题。');
+    parts.push('请基于上面的会议上下文作答。回答只发给提问的人，不发进会议，可以完整作答，不要用 markdown 标题。');
   } else if (input.longAnswerChars && input.longAnswerChars > 0) {
     parts.push(
       '请基于上面的会议上下文作答。回答会发到会议聊天里，大家都看得到。简单问题直接答，200 字内，不要用 markdown 标题。',
@@ -1001,8 +1034,10 @@ interface RunOptions {
   scopeId?: string;
   /** Chat the run belongs to when there is no meeting session. */
   chatId?: string;
-  /** A rejected run (scope busy, reconnecting) comes back as '' instead of the reason. */
+  /** A rejected run (scope busy, reconnecting) throws {@link RunRefused} instead of answering with the reason. */
   silentReject?: boolean;
+  /** An in-meeting question: counted against {@link MEETING_MAX_PARALLEL} and stoppable while waiting. */
+  track?: boolean;
   usedPrefix?: string;
   elevate?: boolean;
   tier?: AccessMode;
@@ -1024,27 +1059,71 @@ export type RunDeps = Pick<MeetingAgentDeps, 'controls' | 'executor' | 'sessions
   session?: Pick<MeetingSession, 'meetingId' | 'meetingNo' | 'originChatId'>;
 };
 
+/** A run the bridge would not start (scope busy, runs paused, workspace missing…). */
+export class RunRefused extends Error {
+  constructor(
+    readonly code: string,
+    readonly userVisible: string,
+  ) {
+    super(userVisible);
+    this.name = 'RunRefused';
+  }
+}
+
 /**
- * One read-only run in its own scope, drained into the answer text; '' when
- * the run was rejected (scope busy). For work the meeting did not ask for:
- * the unasked interjection, history questions over the minutes archive.
+ * One read-only run in its own scope, drained into the answer text; when the
+ * bridge would not start it, `refused` says why. For work the meeting did not
+ * ask for: the unasked interjection, history questions over the archive.
  */
-export function runReadOnlyPrompt(
+export async function runReadOnlyPrompt(
   deps: RunDeps,
   prompt: string,
   scopeId: string,
   chatId?: string,
-): Promise<string> {
-  return runMeetingAgent(deps, prompt, {
-    scopeId,
-    tier: meetingReadOnlyAccess(deps.controls.profileConfig),
-    silentReject: true,
-    ...(chatId ? { chatId } : {}),
-  });
+): Promise<{ text: string; refused?: { code: string; userVisible: string } }> {
+  try {
+    const text = await runMeetingAgent(deps, prompt, {
+      scopeId,
+      tier: meetingReadOnlyAccess(deps.controls.profileConfig),
+      silentReject: true,
+      ...(chatId ? { chatId } : {}),
+    });
+    return { text };
+  } catch (err) {
+    if (err instanceof RunRefused) return { text: '', refused: { code: err.code, userVisible: err.userVisible } };
+    throw err;
+  }
 }
 
 /** Submit one run and drain it into a single answer string. */
 async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions = {}): Promise<string> {
+  const meetingId = deps.session?.meetingId;
+  const scopeId = opts.scopeId;
+  if (!opts.track || !meetingId || !scopeId) return runOnce(deps, prompt, opts);
+  const runs = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
+  // The same asker again: let the scope reservation refuse it ("你上一个问题还在回答").
+  if (runs.has(scopeId)) return runOnce(deps, prompt, opts);
+  if (runs.size >= MEETING_MAX_PARALLEL) {
+    log.info('meeting', 'ask-over-cap', { meetingId, running: runs.size });
+    return `现在已经有 ${runs.size} 个问题在回答，等其中一个答完再问我。`;
+  }
+  const state = { cancelled: false };
+  runs.set(scopeId, state);
+  askRuns.set(meetingId, runs);
+  try {
+    return await runOnce(deps, prompt, opts, state);
+  } finally {
+    runs.delete(scopeId);
+    if (runs.size === 0 && askRuns.get(meetingId) === runs) askRuns.delete(meetingId);
+  }
+}
+
+async function runOnce(
+  deps: RunDeps,
+  prompt: string,
+  opts: RunOptions,
+  state?: { cancelled: boolean },
+): Promise<string> {
   const { controls } = deps;
   // Without a meeting (history questions) the caller always names the scope.
   const session = deps.session ?? { meetingId: '-', meetingNo: '-', originChatId: opts.chatId };
@@ -1100,7 +1179,7 @@ async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions =
       reason: result.rejectReason.code,
     });
     if (opts.minutes) throw new Error(result.rejectReason.userVisible);
-    if (opts.silentReject) return '';
+    if (opts.silentReject) throw new RunRefused(result.rejectReason.code, result.rejectReason.userVisible);
     // The generic "already running" text is a dead end inside a meeting, where
     // /stop isn't reachable — point at the in-meeting escape hatch instead.
     if (result.rejectReason.code === 'run-already-active') {
@@ -1114,6 +1193,13 @@ async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions =
       return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
     }
     return result.rejectReason.userVisible;
+  }
+
+  // Stopped while it waited for a process slot: end it before it says anything.
+  if (state?.cancelled) {
+    await result.execution.stop().catch(() => {});
+    log.info('meeting', 'ask-cancelled-before-start', { meetingId: session.meetingId });
+    return '';
   }
 
   let answer = '';

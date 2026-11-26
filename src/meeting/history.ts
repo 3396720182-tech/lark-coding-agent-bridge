@@ -23,24 +23,30 @@ const MAX_MEETINGS = 6;
 const BUDGET_CHARS = 40_000;
 
 const MEETING_WORD = /(会议|例会|周会|晨会|早会|夕会|评审会|复盘会|启动会|站会|开会|的会(?=[\s，,。？?上里定说聊讨有都结谁怎最的]|$)|那个会|那场会|这个会|上次会|会上|纪要)/;
-const RECALL_WORD =
-  /(定了什么|定了啥|定的什么|定的啥|怎么定的|决定了什么|决定了啥|结论是什么|结论是啥|什么结论|啥结论|说了什么|说了啥|聊了什么|聊了啥|讨论了什么|讨论了啥|讲了什么|讲了啥|有什么待办|有哪些待办|待办是什么|待办有哪些|谁负责|安排了什么|分工|纪要)/;
+/** Asking what a meeting settled: a recall on its own. */
+const STRONG_RECALL = /(定了什么|定了啥|定的什么|定的啥|怎么定的|决定了什么|决定了啥|结论是什么|结论是啥|什么结论|啥结论|有什么结论)/;
+/** Could be about a past meeting or about one being planned: needs a past anchor. */
+const WEAK_RECALL =
+  /(说了什么|说了啥|聊了什么|聊了啥|讨论了什么|讨论了啥|讲了什么|讲了啥|有什么待办|有哪些待办|待办是什么|待办有哪些|谁负责|安排了什么|纪要)/;
+/** Points at a meeting that already happened. */
+const PAST =
+  /(上上周|上周|上个?星期|上次|上回|昨天|前天|今天上午|上个月|这周|本周|那天|最近|之前|刚才|刚刚|那个会|那场会|那次|(?<![\w.])\d{1,2}\s*(?:月|\/|-)\s*\d{1,2})/;
+/** Planning ahead or asking for work: not a recall, whatever else the sentence says. */
+const NOT_RECALL =
+  /(明天|后天|下周|下个月|待会|一会儿|等会|要开|将要|准备开|打算|翻译|设计一下|帮我写|写个|写一份|写一下|列个|列一下|整理成|生成|润色|改一下|模板)/;
 
 /**
- * Is this DM a question about a past meeting? Needs both a meeting word and a
- * recall phrase ("那个会" + "定了什么"); "帮我写个会议纪要模板" has no recall
- * phrase other than 纪要, so it also needs a past-time word to count.
+ * Is this DM a question about a past meeting? Needs a meeting word and a
+ * recall phrase. "定了什么 / 结论是什么" count on their own; "谁负责 / 说了什么
+ * / 纪要" only with a past anchor (上周, 昨天, 那个会, 11月20日 …). Plans
+ * ("明天的评审会谁负责主持") and requests ("把今天的会议纪要翻译成英文") never count.
  */
 export function looksLikeHistoryQuestion(text: string): boolean {
   const t = String(text ?? '').trim();
   if (!t || t.startsWith('/') || t.length > 200) return false;
-  if (!MEETING_WORD.test(t) || !RECALL_WORD.test(t)) return false;
-  // "纪要" alone is too broad (writing minutes is a normal request): ask for a time too.
-  const recall = RECALL_WORD.exec(t)?.[0];
-  if (recall === '纪要' && !/(上周|上次|上回|昨天|前天|今天|上个月|这周|本周|那天|最近|之前|\d+\s*[月.\/-]\s*\d+)/.test(t)) {
-    return false;
-  }
-  return true;
+  if (!MEETING_WORD.test(t) || NOT_RECALL.test(t)) return false;
+  if (STRONG_RECALL.test(t)) return true;
+  return WEAK_RECALL.test(t) && PAST.test(t);
 }
 
 export interface TimeWindow {
@@ -92,7 +98,8 @@ export function historyWindow(text: string, now = Date.now()): TimeWindow {
     const n = Number(recent[1]);
     return { from: today - (n - 1) * DAY, to: now + 1, label: `最近 ${n} 天` };
   }
-  const md = /(\d{1,2})\s*(?:月|\.|\/|-)\s*(\d{1,2})\s*(?:日|号)?/.exec(t);
+  // Not "2.3" in "v2.3版本": a dot is a version, and the number must stand on its own.
+  const md = /(?<![\w.])(\d{1,2})\s*(?:月|\/|-)\s*(\d{1,2})(?![\d.])\s*(?:日|号)?/.exec(t);
   if (md) {
     const month = Number(md[1]) - 1;
     const date = Number(md[2]);
@@ -126,7 +133,7 @@ export function loadArchives(dataDir: string): MinutesRecord[] {
 
 /** Words that say *when* or *how to ask*, not *which meeting*: not used for matching. */
 const NOISE =
-  /(上上周|上周|这周|本周|今天|昨天|前天|上个?月|这个?月|本月|最近|上次|上回|那个|那场|这个|会议|例会|周会|开会|的会|纪要|定了什么|定了啥|决定|结论|说了什么|聊了什么|讨论了什么|待办|谁负责|是什么|什么|一下|帮我|查查|查一下|请问|我们|你们|他们|和|跟|与|的|了|吗|呢|啊|吧|？|\?|，|。)/g;
+  /(上上周|上周|这周|本周|今天|昨天|前天|上个?月|这个?月|本月|最近|上次|上回|那个|那场|这个|会议|例会|周会|开会|的会|纪要|定了什么|定了啥|决定|结论|说了什么|聊了什么|讨论了什么|待办|谁负责|是什么|什么|一下|帮我|查查|查一下|请问|我们|你们|他们|？|\?|，|。)/g;
 
 /** Pick the minutes a question is about: in its time window, ranked by shared words, then by recency. */
 export function pickArchives(
@@ -197,6 +204,12 @@ export function buildHistoryPrompt(question: string, picked: MinutesRecord[], wi
   return parts.join('\n');
 }
 
+/** Would the archive have anything for this question? (The DM shortcut only takes questions it can answer.) */
+export function historyHasMatch(dataDir: string, question: string, now = Date.now()): boolean {
+  const all = loadArchives(dataDir);
+  return all.length > 0 && pickArchives(all, question, now).picked.length > 0;
+}
+
 export interface HistoryDeps extends RunDeps {
   chatId: string;
 }
@@ -217,13 +230,16 @@ export async function answerMeetingHistory(deps: HistoryDeps, question: string, 
     const latest = all[0]!;
     return `没找到${window.label}的会议纪要（本机共 ${all.length} 份，最近一份是 ${historyLabel(latest)}）。换个时间问问看，比如「${historyLabel(latest).slice(0, 5)} 那个会定了什么」。`;
   }
-  const answer = await runReadOnlyPrompt(
+  const { text: answer, refused } = await runReadOnlyPrompt(
     deps,
     buildHistoryPrompt(question, picked, window),
     `meeting-history:${deps.chatId}`,
     deps.chatId,
   );
-  if (!answer) return '上一个查纪要的问题还在处理，稍后再问。';
+  if (refused) {
+    return refused.code === 'run-already-active' ? '上一个查纪要的问题还在处理，稍后再问。' : `没能查：${refused.userVisible}`;
+  }
+  if (!answer) return '没有查出结果（agent 没有返回内容）。';
   const sources = picked.map((r) => `${historyLabel(r)}（存档 ${r.id}）`).join('、');
   return `${answer}\n\n> 查的是本机存档的纪要：${sources}`;
 }

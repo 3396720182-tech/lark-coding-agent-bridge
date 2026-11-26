@@ -91,6 +91,24 @@ export function attachVoiceWake(deps: VoiceWakeDeps, onAsk: (ask: VoiceAsk) => v
     return cfg.names.length ? cfg.names : own ? [own] : [];
   };
 
+  const nameOnly = (text: string): boolean => {
+    const rest = matchWakeName(text, names());
+    return rest !== undefined && rest.replace(/[\s,，、。.!！?？~～]/g, '').length < 2;
+  };
+  /** This speaker said only the name a moment ago and that sentence is still settling. */
+  const nameStillSettling = (speakerId: string | undefined, sentenceId: string): boolean =>
+    Boolean(speakerId) &&
+    [...settling.values()].some(
+      (p) => p.event.speaker.id === speakerId && p.event.sentenceId !== sentenceId && nameOnly(p.event.text),
+    );
+  const arm = (event: TranscriptEvent): void => {
+    const prior = settling.get(event.sentenceId);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => fire(event), VOICE_SETTLE_MS);
+    timer.unref?.();
+    settling.set(event.sentenceId, { timer, event });
+  };
+
   const fire = (event: TranscriptEvent): void => {
     settling.delete(event.sentenceId);
     if (session.ended || done.has(event.sentenceId)) return;
@@ -103,7 +121,11 @@ export function attachVoiceWake(deps: VoiceWakeDeps, onAsk: (ask: VoiceAsk) => v
       question = event.text.trim();
     } else {
       const rest = matchWakeName(event.text, names());
-      if (rest === undefined) return;
+      if (rest === undefined) {
+        // The follow-up settled before the name-only sentence did: wait for it.
+        if (nameStillSettling(speakerId, event.sentenceId)) arm(event);
+        return;
+      }
       done.add(event.sentenceId);
       if (!meetingVoiceAllowed({ session, controls }, speakerId)) return;
       if (rest.replace(/[\s,，、。.!！?？~～]/g, '').length < 2) {
@@ -126,17 +148,17 @@ export function attachVoiceWake(deps: VoiceWakeDeps, onAsk: (ask: VoiceAsk) => v
     const follow = speakerId ? waiting.get(speakerId) : undefined;
     const candidate =
       matchWakeName(event.text, names()) !== undefined ||
-      Boolean(follow && follow.after !== event.sentenceId && now() <= follow.until);
-    const prior = settling.get(event.sentenceId);
-    if (prior) clearTimeout(prior.timer);
+      Boolean(follow && follow.after !== event.sentenceId && now() <= follow.until) ||
+      // Said right after the name, before the name-only sentence settled.
+      nameStillSettling(speakerId, event.sentenceId);
     if (!candidate) {
       // A revision that no longer starts with the name ("小助手" → "小猪手").
+      const prior = settling.get(event.sentenceId);
+      if (prior) clearTimeout(prior.timer);
       settling.delete(event.sentenceId);
       return;
     }
-    const timer = setTimeout(() => fire(event), VOICE_SETTLE_MS);
-    timer.unref?.();
-    settling.set(event.sentenceId, { timer, event });
+    arm(event);
   });
 
   return () => {

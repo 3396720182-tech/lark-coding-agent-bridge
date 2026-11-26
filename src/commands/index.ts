@@ -87,7 +87,8 @@ import { meetingAuthzSummary } from '../meeting/authz';
 import type { MeetingSession } from '../meeting/session';
 import { handleMeetingTodo } from '../meeting/minutes';
 import { handleMeetingTask } from '../meeting/tasks';
-import { answerMeetingHistory, looksLikeHistoryQuestion } from '../meeting/history';
+import { answerMeetingHistory, historyHasMatch, looksLikeHistoryQuestion } from '../meeting/history';
+import { meetingDataDir } from '../meeting/store';
 import { handleMeetingDoc, parseDocLinks, replyMeetingDocs } from '../meeting/docs';
 import { hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 
@@ -286,9 +287,17 @@ async function tryBindMeetingDoc(ctx: CommandContext, trimmed: string): Promise<
 async function tryAnswerMeetingHistory(ctx: CommandContext, trimmed: string): Promise<boolean> {
   if (ctx.msg.chatType !== 'p2p') return false;
   const m = ctx.controls.profileConfig.meeting;
-  if (!m.enabled || !m.historyInDm || !ctx.runExecutor) return false;
+  if (!m.enabled || !m.historyInDm || !ctx.runExecutor || !ctx.controls.meeting) return false;
+  // A message with files is a task for the agent, whatever it says.
+  if (ctx.msg.resources.length > 0) return false;
   if (!looksLikeHistoryQuestion(trimmed)) return false;
   if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) return false;
+  // Nothing in the archive for it: let the agent have the message as usual.
+  try {
+    if (!historyHasMatch(meetingDataDir(ctx.controls), trimmed)) return false;
+  } catch {
+    return false;
+  }
   log.info('meeting', 'history-intercept', { sender: ctx.msg.senderId.slice(-6) });
   try {
     await handleMeeting(`history ${trimmed}`, ctx);
@@ -2203,6 +2212,11 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
       return;
     case 'history': {
       // Past meetings, from the minutes archive; no live meeting needed.
+      // Minutes of every archived meeting are behind this: never into a group.
+      if (ctx.msg.chatType !== 'p2p') {
+        await reply(ctx, '查过去的会议纪要只能私聊我用，群里不行（纪要里可能有群成员没参加的会）。');
+        return;
+      }
       if (!rest) {
         await reply(ctx, '用法：`/meeting history <问题>`，比如 `/meeting history 上周和设计组的会定了什么`。也可以直接私聊问。');
         return;

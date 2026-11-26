@@ -386,10 +386,18 @@ export class MeetingSession {
     return this.bySentence.get(sentenceId)?.seq;
   }
 
-  /** Lines that arrived after `seq`, oldest first. */
-  linesAfter(seq: number): { kind: 'speech' | 'chat'; speaker: string; speakerId?: string; text: string }[] {
+  /** Time (epoch ms) of the line with this arrival number. */
+  atOf(seq: number): number | undefined {
+    return this.lines.find((l) => l.seq === seq)?.at;
+  }
+
+  /**
+   * Lines that came after a given line: arrived later, or (for a line that
+   * reached us late, e.g. through gap-fill) were said later. Oldest first.
+   */
+  linesAfter(seq: number, at?: number): { kind: 'speech' | 'chat'; speaker: string; speakerId?: string; text: string }[] {
     return this.lines
-      .filter((l) => l.seq > seq)
+      .filter((l) => l.seq > seq || (at !== undefined && l.seq !== seq && l.at > at))
       .sort((a, b) => a.seq - b.seq)
       .map((l) => ({ kind: l.kind, speaker: l.speaker, ...(l.speakerId ? { speakerId: l.speakerId } : {}), text: l.text }));
   }
