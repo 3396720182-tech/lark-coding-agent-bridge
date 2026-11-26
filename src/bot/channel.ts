@@ -52,6 +52,8 @@ import { meetingAccessConverged, meetingEffectiveAccess } from '../meeting/authz
 import { describeMeetingError, MeetingManager } from '../meeting/manager';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
+import { meetingDataDir } from '../meeting/store';
+import { transcriptDir } from '../meeting/transcript-log';
 import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
@@ -442,6 +444,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const meetingConfig = () => controls.profileConfig.meeting;
   let meetingManager: MeetingManager | undefined;
   if (meetingConfig().enabled) {
+    let meetingTranscriptDir: string | undefined;
+    try {
+      meetingTranscriptDir = transcriptDir(meetingDataDir(controls));
+    } catch (err) {
+      log.warn('meeting', 'data-dir-failed', { err: String(err) });
+    }
     meetingManager = new MeetingManager({
       client: channel.rawClient as unknown as VcRequestClient,
       config: meetingConfig,
@@ -474,6 +482,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ...(deps.appPaths?.mediaDir
         ? { stateFile: join(dirname(deps.appPaths.mediaDir), 'meetings.json') }
         : {}),
+      // Full transcripts live with the other meeting data (minutes, docs).
+      ...(meetingTranscriptDir ? { transcriptDir: meetingTranscriptDir } : {}),
+      appId: cfg.accounts.app.id,
       onResumeEnded: (meeting, err) => {
         if (!controls.botOwnerId) return;
         void channel

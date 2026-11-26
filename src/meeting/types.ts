@@ -20,6 +20,11 @@ export interface TranscriptEvent {
   startMs?: number;
   endMs?: number;
   language?: string;
+  /**
+   * When it was said (epoch ms), from the event itself. Absent when the event
+   * carries no absolute time; callers then fall back to the arrival time.
+   */
+  atMs?: number;
   /** True when the speaker is our own bot (its speech is transcribed back). */
   selfEcho: boolean;
 }
@@ -30,6 +35,8 @@ export interface ChatEvent {
   content: string;
   /** Feishu's in-meeting message type; `3` is a reaction rather than text. */
   messageType?: number;
+  /** When it was sent (epoch ms), from the event itself; see {@link TranscriptEvent.atMs}. */
+  atMs?: number;
 }
 
 export interface ParticipantEvent {
@@ -72,6 +79,19 @@ function num(v: unknown): number | undefined {
 }
 
 /**
+ * An absolute timestamp as epoch ms. Feishu mixes Unix seconds and
+ * milliseconds, as numbers or numeric strings; values that cannot be an
+ * absolute time (offsets from the meeting start, garbage) are undefined.
+ */
+export function epochMs(v: unknown): number | undefined {
+  const n = num(v);
+  if (n === undefined || n <= 0) return undefined;
+  const ms = n < 1e11 ? n * 1000 : n;
+  // 2001-09-09 .. 2286: anything outside is not an absolute time.
+  return ms >= 1e12 && ms < 1e13 ? Math.floor(ms) : undefined;
+}
+
+/**
  * Pull the actor out of an item. The wire format is inconsistent about the
  * wrapper key (`speaker` / `user` / `operator` / `sender` / flat), so probe.
  */
@@ -102,6 +122,8 @@ export function unpackActivity(item: RawActivityItem, botOpenId?: string): Meeti
   const raw = item[field] ?? asRecord(item.payload)[field];
   const arr = Array.isArray(raw) ? raw : [];
   const out: MeetingEvent[] = [];
+  // Envelope time: what an item without its own timestamp falls back to.
+  const eventAt = epochMs((item as { event_time?: unknown }).event_time);
 
   for (const entry of arr) {
     const it = asRecord(entry);
@@ -112,6 +134,7 @@ export function unpackActivity(item: RawActivityItem, botOpenId?: string): Meeti
         if (!text || !sentenceId) break;
         // `operator` last: no real transcript sample yet, so existing keys keep priority.
         const speaker = actor(it, 'speaker', 'user', 'sender', 'operator');
+        const atMs = epochMs(it.start_time_ms ?? it.start_ms) ?? epochMs(it.time) ?? eventAt;
         out.push({
           kind: 'transcript',
           speaker,
@@ -124,6 +147,7 @@ export function unpackActivity(item: RawActivityItem, botOpenId?: string): Meeti
             ? { endMs: num(it.end_time_ms ?? it.end_ms) }
             : {}),
           ...(str(it.language) ? { language: str(it.language) } : {}),
+          ...(atMs !== undefined ? { atMs } : {}),
           selfEcho: Boolean(botOpenId && speaker.id === botOpenId),
         });
         break;
@@ -131,6 +155,7 @@ export function unpackActivity(item: RawActivityItem, botOpenId?: string): Meeti
       case 'chat_received': {
         const content = str(it.content) ?? str(it.text) ?? '';
         if (!content) break;
+        const atMs = epochMs(it.time ?? it.create_time ?? it.send_time) ?? eventAt;
         out.push({
           kind: 'chat',
           // Real chat_received items carry the sender as
@@ -138,6 +163,7 @@ export function unpackActivity(item: RawActivityItem, botOpenId?: string): Meeti
           from: actor(it, 'operator', 'sender', 'user', 'from'),
           content,
           ...(num(it.message_type) !== undefined ? { messageType: num(it.message_type) } : {}),
+          ...(atMs !== undefined ? { atMs } : {}),
         });
         break;
       }

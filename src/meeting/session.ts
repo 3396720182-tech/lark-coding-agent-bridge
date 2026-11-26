@@ -9,11 +9,83 @@ import {
   type VcRequestClient,
 } from './api';
 import { unpackActivity, type MeetingEvent, type TranscriptEvent } from './types';
+import {
+  clockLabel,
+  loadTranscript,
+  renderTranscriptText,
+  TranscriptLog,
+  transcriptFile,
+  transcriptTextFile,
+  type TranscriptLine,
+  type TranscriptRecord,
+} from './transcript-log';
 
 export type MeetingEventSourceKind = 'push' | 'poll';
 
 /** Consecutive poll failures before the owner is told. */
 export const POLL_FAILURE_ALERT = 5;
+
+/**
+ * Once push delivers, the poller keeps running this slowly as a gap-fill lane:
+ * pushes can be dropped, and `event_id` dedup makes the overlap harmless.
+ */
+export const GAP_FILL_INTERVAL_MS = 60_000;
+
+/** A full re-read of the meeting's events from the start, at least this often while in it. */
+export const FULL_BACKFILL_INTERVAL_MS = 15 * 60_000;
+
+/** After someone leaves (the meeting may be ending), re-read everything this soon. */
+export const LEAVE_BACKFILL_DELAY_MS = 5_000;
+
+/** Two full re-reads no closer than this, except the explicit ones (leave, resume). */
+export const BACKFILL_MIN_GAP_MS = 60_000;
+
+/** Memory guard only: far beyond any real meeting (a 3-hour one is a few thousand lines). */
+const MAX_LINES = 50_000;
+
+/** Dedup ids kept per meeting. Large on purpose: a full re-read replays every event. */
+const MAX_SEEN_EVENTS = 100_000;
+
+/** One line of the meeting record: a transcript sentence or a chat message. */
+interface MeetingLine {
+  kind: 'speech' | 'chat';
+  sentenceId?: string;
+  speaker: string;
+  speakerId?: string;
+  text: string;
+  /** Epoch ms used for ordering and the time label (event time, else arrival). */
+  at: number;
+  /** Arrival order — the tie-breaker when two lines share a timestamp. */
+  seq: number;
+  /** Chat only: what kind of dedup key it arrived under (see {@link hasChat}). */
+  keyKind?: KeyKind;
+  /** Dedup key of the item it (last) came from. */
+  eid?: string;
+}
+
+/** How an item reached {@link MeetingSession.ingest}. */
+export interface IngestOptions {
+  /**
+   * Store it, but tell no subscriber: a re-read of old events must not answer
+   * old questions or fire old alerts. A sentence already held is only
+   * replaced by a longer version, so a replayed early prefix cannot overwrite
+   * the final text.
+   */
+  quiet?: boolean;
+  /**
+   * Came through the poller while push is the main lane: anything here was
+   * either already pushed or dropped by push. Subscribers still hear what is
+   * new (a dropped question should be answered), but a sentence already held
+   * is only replaced by a longer version — this lane runs behind push and
+   * would otherwise roll a sentence back to an older revision.
+   */
+  gapFill?: boolean;
+}
+
+/** `content`: dedup key built from the item's content (it had no `event_id`). */
+type KeyKind = 'id' | 'content';
+const keyKind = (eid: string | undefined): KeyKind | undefined =>
+  eid === undefined ? undefined : /^[a-z_]+#/.test(eid) ? 'content' : 'id';
 
 export interface MeetingSessionStatus {
   meetingId: string;
@@ -38,6 +110,17 @@ export interface MeetingSessionStatus {
   deniedCount: number;
   /** Transcript lines that fired a keyword / speaker alert. */
   alertHits: number;
+  /** Chat lines held (reactions excluded). */
+  chatLines: number;
+  /** Full re-reads done, and lines they recovered that the live lanes had missed. */
+  backfills: number;
+  backfilled: number;
+  /** Activity items fetched by the poller (not catch-up or re-reads). */
+  polled: number;
+  /** Where the full transcript is being written; absent when saving is off. */
+  transcriptFile?: string;
+  /** The readable copy, once written (meeting ended or left). */
+  transcriptText?: string;
 }
 
 export interface MeetingSessionDeps {
@@ -50,6 +133,11 @@ export interface MeetingSessionDeps {
   botOpenId?: string;
   /** Chat that started this session — where IM answers go back to. */
   originChatId?: string;
+  /**
+   * Directory for the full transcript (`transcript-log.ts`). Omit, or set
+   * `transcript.save: false`, to keep it in memory only.
+   */
+  transcriptDir?: string;
   now?: () => number;
 }
 
@@ -86,25 +174,41 @@ export class MeetingSession {
   private readonly botOpenId?: string;
   private readonly now: () => number;
 
-  /** Rolling transcript kept structurally so a re-sent sentence replaces in place. */
-  private transcript: { sentenceId: string; speaker: string; text: string; seq: number }[] = [];
   /**
-   * In-meeting chat lines. Chat is meeting content too: a meeting without
-   * transcription (captions off) only has chat, and without this buffer the
-   * agent's context and the end-of-meeting summary would both be empty.
+   * The whole meeting so far — transcript sentences and chat — not a rolling
+   * window: the minutes need all of it. `transcript.keep` only bounds what an
+   * in-meeting answer is given ({@link recentContext}). Chat is meeting content
+   * too: a meeting without transcription (captions off) only has chat.
    */
-  private chatLines: { speaker: string; text: string; seq: number }[] = [];
+  private lines: MeetingLine[] = [];
+  /** sentence_id → its line, so a re-sent sentence replaces in place. */
+  private bySentence = new Map<string, MeetingLine>();
   /**
    * Arrival order shared by transcript and chat lines. A counter, not a clock:
    * a poll page or a catch-up delivers many events in the same millisecond.
    */
   private seq = 0;
+  private readonly transcriptLog?: TranscriptLog;
+  private readonly textFile?: string;
+  private backfillRun?: Promise<number>;
+  private backfillTimer?: ReturnType<typeof setTimeout>;
+  private periodic?: ReturnType<typeof setTimeout>;
+  private lastBackfillAt = 0;
+  private backfills = 0;
+  private backfilled = 0;
+  private polled = 0;
+  private savedText?: string;
+  /** Lines the current quiet ingest added (counts recoveries; longer versions don't count). */
+  private quietGain = 0;
   /** sentence_id → latest text, so a re-sent sentence overwrites rather than appends. */
   private sentences = new Map<string, string>();
   /** event_id of already-ingested activity items (push replay / poll overlap). */
   private seenEvents = new Set<string>();
   /** Pending debounce timers when `stabilizeMs > 0`. */
-  private pending = new Map<string, ReturnType<typeof setTimeout>>();
+  private pending = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; event: TranscriptEvent; eid: string | undefined }
+  >();
   private handlers = new Map<string, Set<(e: MeetingEvent) => void>>();
   private participantIds = new Set<string>();
 
@@ -136,6 +240,54 @@ export class MeetingSession {
     if (deps.originChatId) this.originChatId = deps.originChatId;
     this.now = deps.now ?? (() => Date.now());
     this.startedAt = new Date(this.now()).toISOString();
+    if (deps.transcriptDir && this.config.transcript.save) {
+      const file = transcriptFile(deps.transcriptDir, this.meetingId);
+      this.textFile = transcriptTextFile(deps.transcriptDir, this.meetingId);
+      // A restarted bridge picks up where the file left off, so the minutes
+      // still cover the part before the restart.
+      const prior = loadTranscript(file);
+      for (const rec of prior.records) this.restore(rec);
+      this.transcriptLog = new TranscriptLog(file, {
+        k: 'meta',
+        meetingId: this.meetingId,
+        meetingNo: this.meetingNo,
+        ...(this.topic ? { topic: this.topic } : {}),
+        joinedAt: prior.meta?.joinedAt ?? this.startedAt,
+      });
+      if (prior.records.length) {
+        log.info('meeting', 'transcript-restored', { meetingId: this.meetingId, lines: this.lines.length });
+      }
+    }
+  }
+
+  /** Rebuild one line from the transcript file (no event, no write). */
+  private restore(rec: TranscriptRecord): void {
+    if (rec.k === 'seen') {
+      for (const id of rec.seen) this.seenEvents.add(id);
+      return;
+    }
+    if (rec.eid) this.seenEvents.add(rec.eid);
+    if (rec.k === 'speech' && rec.sid) {
+      this.sentences.set(rec.sid, rec.text);
+      const known = this.bySentence.get(rec.sid);
+      if (known) {
+        known.text = rec.text;
+        return;
+      }
+    }
+    const line: MeetingLine = {
+      kind: rec.k,
+      ...(rec.sid ? { sentenceId: rec.sid } : {}),
+      speaker: rec.who,
+      ...(rec.whoId ? { speakerId: rec.whoId } : {}),
+      text: rec.text,
+      at: rec.at,
+      seq: ++this.seq,
+      ...(rec.k === 'chat' && rec.eid ? { keyKind: keyKind(rec.eid)! } : {}),
+      ...(rec.eid ? { eid: rec.eid } : {}),
+    };
+    this.lines.push(line);
+    if (line.sentenceId) this.bySentence.set(line.sentenceId, line);
   }
 
   status(): MeetingSessionStatus {
@@ -145,13 +297,19 @@ export class MeetingSession {
       ...(this.topic ? { topic: this.topic } : {}),
       startedAt: this.startedAt,
       source: this.source,
-      transcriptLines: this.transcript.length,
+      transcriptLines: this.transcriptLineCount(),
       participants: this.participantIds.size,
       ingested: this.ingested,
       eventCounts: { ...this.eventCounts },
       ended: this.ended,
       deniedCount: this.deniedCount,
       alertHits: this.alertHits,
+      chatLines: this.lines.length - this.transcriptLineCount(),
+      backfills: this.backfills,
+      backfilled: this.backfilled,
+      polled: this.polled,
+      ...(this.transcriptLog ? { transcriptFile: this.transcriptLog.file } : {}),
+      ...(this.savedText ? { transcriptText: this.savedText } : {}),
     };
   }
 
@@ -163,30 +321,45 @@ export class MeetingSession {
     return () => set!.delete(handler);
   }
 
-  /** Latest transcript as `说话人: 内容` lines, oldest first — agent context. */
+  /** Lines in meeting order: by time, then arrival. */
+  private ordered(): MeetingLine[] {
+    return [...this.lines].sort((a, b) => a.at - b.at || a.seq - b.seq);
+  }
+
+  /** Latest transcript as `说话人: 内容` lines, oldest first; all of it without `limit`. */
   recentTranscript(limit?: number): string[] {
-    const slice =
-      !limit || limit >= this.transcript.length ? this.transcript : this.transcript.slice(-limit);
+    const speech = this.ordered().filter((l) => l.kind === 'speech');
+    const slice = !limit || limit >= speech.length ? speech : speech.slice(-limit);
     return slice.map((l) => `${l.speaker}: ${l.text}`);
   }
 
   /**
-   * Transcript and in-meeting chat merged in arrival order, oldest first — the
-   * agent's context. Chat lines are tagged so the agent can tell typed messages
-   * from speech.
+   * Transcript and in-meeting chat merged in meeting order, oldest first — the
+   * agent's context for in-meeting answers (pass `transcript.keep`). Chat lines
+   * are tagged so the agent can tell typed messages from speech.
    */
   recentContext(limit?: number): string[] {
-    const lines = [
-      ...this.transcript.map((l) => ({ seq: l.seq, line: `${l.speaker}: ${l.text}` })),
-      ...this.chatLines.map((c) => ({ seq: c.seq, line: `${c.speaker}（弹幕）: ${c.text}` })),
-    ].sort((a, b) => a.seq - b.seq);
-    const slice = !limit || limit >= lines.length ? lines : lines.slice(-limit);
-    return slice.map((l) => l.line);
+    const all = this.ordered();
+    const slice = !limit || limit >= all.length ? all : all.slice(-limit);
+    return slice.map(formatLine);
   }
 
-  /** Number of buffered transcript lines (chat excluded). */
+  /**
+   * The whole meeting with a `[HH:mm:ss]` label per line — what the minutes
+   * are written from.
+   */
+  fullContext(): string[] {
+    return this.ordered().map((l) => `[${clockLabel(l.at)}] ${formatLine(l)}`);
+  }
+
+  /** Number of transcript lines held (chat excluded). */
   transcriptLineCount(): number {
-    return this.transcript.length;
+    return this.bySentence.size;
+  }
+
+  /** Number of lines held, transcript and chat. */
+  lineCount(): number {
+    return this.lines.length;
   }
 
   /**
@@ -198,17 +371,16 @@ export class MeetingSession {
   markPushActive(): void {
     if (this.source === 'push') return;
     this.source = 'push';
-    if (this.poller) {
-      this.stopPolling();
-      log.info('meeting', 'poll-stopped-push-active', { meetingId: this.meetingId });
-    }
+    // The poller is not stopped, only slowed (see GAP_FILL_INTERVAL_MS): a
+    // dropped push would otherwise be lost for good. Dedup makes overlap free.
+    if (this.poller) log.info('meeting', 'poll-slowed-push-active', { meetingId: this.meetingId });
   }
 
   /**
    * Ingest one raw activity item. Idempotent per `event_id`, so replayed pushes
    * and poll/push overlap during gap-fill collapse to one delivery.
    */
-  ingest(item: RawActivityItem): void {
+  ingest(item: RawActivityItem, opts: IngestOptions = {}): void {
     if (this.ended) return;
     // Push and poll deliver the *same* content by design (poll is the gap-fill
     // lane), so every item can arrive twice. `event_id` is the intended dedup
@@ -219,12 +391,12 @@ export class MeetingSession {
     if (eventId) {
       if (this.seenEvents.has(eventId)) return;
       this.seenEvents.add(eventId);
-      // Bound the dedup set; meetings are long-lived and ids never repeat once
-      // they've scrolled far enough out of the window.
-      if (this.seenEvents.size > 5000) {
+      // Bound the dedup set. Generous: a full re-read replays the whole
+      // meeting, and an evicted id lets an old chat line in a second time.
+      if (this.seenEvents.size > MAX_SEEN_EVENTS) {
         for (const id of this.seenEvents) {
           this.seenEvents.delete(id);
-          if (this.seenEvents.size <= 4000) break;
+          if (this.seenEvents.size <= MAX_SEEN_EVENTS * 0.8) break;
         }
       }
     }
@@ -244,24 +416,37 @@ export class MeetingSession {
       });
     }
     for (const event of events) {
-      this.handle(event);
+      this.handle(event, eventId, opts);
     }
   }
 
-  private handle(event: MeetingEvent): void {
+  private handle(event: MeetingEvent, eid: string | undefined, opts: IngestOptions): void {
+    const quiet = opts.quiet === true;
     if (event.kind === 'transcript') {
-      this.handleTranscript(event);
+      this.handleTranscript(event, eid, quiet ? 'quiet' : opts.gapFill ? 'gap-fill' : 'live');
       return;
     }
     // message_type 3 is a reaction, not text.
     if (event.kind === 'chat' && event.messageType !== 3 && event.content) {
-      this.chatLines.push({
+      // Push and poll may carry the same message under different dedup keys
+      // (one with event_id, one without). Stored twice it would also be
+      // answered twice.
+      const kind = keyKind(eid);
+      if (this.hasChat(event.from.id ?? event.from.name, event.content, quiet ? event.atMs : (event.atMs ?? this.now()), kind)) {
+        return;
+      }
+      const line = this.addLine({
+        kind: 'chat',
         speaker: event.from.name ?? event.from.id ?? '?',
+        ...(event.from.id ? { speakerId: event.from.id } : {}),
         text: event.content,
+        at: event.atMs ?? this.now(),
         seq: ++this.seq,
+        ...(kind ? { keyKind: kind } : {}),
+        ...(eid ? { eid } : {}),
       });
-      const keep = this.config.transcript.keep;
-      if (this.chatLines.length > keep) this.chatLines = this.chatLines.slice(-keep);
+      this.persistLine(line, eid);
+      if (quiet) this.quietGain += 1;
     }
     if (event.kind === 'participant') {
       const id = event.user.id;
@@ -269,51 +454,148 @@ export class MeetingSession {
         if (event.action === 'joined') this.participantIds.add(id);
         else this.participantIds.delete(id);
       }
+      // People leaving is the only warning before a meeting ends: re-read
+      // everything while the events API still answers.
+      if (event.action === 'left' && !quiet && id !== this.botOpenId) {
+        this.scheduleBackfill('participant-left', LEAVE_BACKFILL_DELAY_MS);
+      }
     }
-    this.emit(event);
+    if (!quiet) this.emit(event);
   }
 
-  private handleTranscript(event: TranscriptEvent): void {
+  /**
+   * The same message already held under the *other* kind of dedup key: same
+   * sender, same text, within two minutes of `at` (any time when unknown).
+   * Two messages that both carry their own `event_id` are two messages, even
+   * when someone types the same thing twice.
+   */
+  private hasChat(who: string | undefined, text: string, at: number | undefined, kind: KeyKind | undefined): boolean {
+    return this.lines.some(
+      (l) =>
+        l.kind === 'chat' &&
+        l.text === text &&
+        (l.speakerId ?? l.speaker) === (who ?? '?') &&
+        (kind === undefined || l.keyKind === undefined || l.keyKind !== kind) &&
+        (at === undefined || Math.abs(l.at - at) < 120_000),
+    );
+  }
+
+  private addLine(line: MeetingLine): MeetingLine {
+    this.lines.push(line);
+    if (line.sentenceId) this.bySentence.set(line.sentenceId, line);
+    if (this.lines.length > MAX_LINES) {
+      const drop = this.lines.splice(0, this.lines.length - MAX_LINES);
+      for (const l of drop) if (l.sentenceId) this.bySentence.delete(l.sentenceId);
+    }
+    return line;
+  }
+
+  private persistLine(line: MeetingLine, eid: string | undefined): void {
+    this.transcriptLog?.append({
+      k: line.kind,
+      ...(line.sentenceId ? { sid: line.sentenceId } : {}),
+      who: line.speaker,
+      ...(line.speakerId ? { whoId: line.speakerId } : {}),
+      text: line.text,
+      at: line.at,
+      ...(eid ? { eid } : {}),
+    });
+  }
+
+  private handleTranscript(
+    event: TranscriptEvent,
+    eid: string | undefined,
+    lane: 'live' | 'gap-fill' | 'quiet',
+  ): void {
     // The bot's own speech comes back through the meeting's transcription; not
     // filtering it here would let "answer whatever you hear" self-trigger.
     if (event.selfEcho) return;
-    if (this.sentences.get(event.sentenceId) === event.text) return; // exact repeat
+    const latest = this.sentences.get(event.sentenceId);
+    if (latest === event.text) return; // exact repeat
+    if (lane !== 'live') {
+      // These lanes replay older revisions too (a re-read from the first, the
+      // gap-fill behind push); only a version longer than the newest one seen
+      // — held or still settling — can be news. Known limit: a final shorter
+      // correction that was itself missed can lose to a longer draft.
+      const held = this.bySentence.get(event.sentenceId)?.text.length ?? -1;
+      if (latest !== undefined && event.text.length <= Math.max(held, latest.length)) {
+        this.noteSeen(eid);
+        return;
+      }
+    }
     this.sentences.set(event.sentenceId, event.text);
+    const isNew = !this.bySentence.has(event.sentenceId);
 
     const stabilizeMs = this.config.transcript.stabilizeMs;
-    if (stabilizeMs <= 0) {
-      this.commitTranscript(event);
+    if (stabilizeMs <= 0 || lane === 'quiet') {
+      // A quiet line is final as it is: drop the (older) revision still settling.
+      const prior = this.pending.get(event.sentenceId);
+      if (prior) {
+        clearTimeout(prior.timer);
+        this.pending.delete(event.sentenceId);
+        this.noteSeen(prior.eid);
+      }
+      this.commitTranscript(event, eid, lane !== 'quiet');
+      if (lane === 'quiet' && isNew) this.quietGain += 1;
       return;
     }
     // Debounce: a sentence is "final" once it stops growing for stabilizeMs.
     const prior = this.pending.get(event.sentenceId);
-    if (prior) clearTimeout(prior);
-    this.pending.set(
-      event.sentenceId,
-      setTimeout(() => {
+    if (prior) {
+      clearTimeout(prior.timer);
+      // The superseded revision is never written as a line; remember its id
+      // so a restarted bridge doesn't take it for news on catch-up.
+      this.noteSeen(prior.eid);
+    }
+    this.pending.set(event.sentenceId, {
+      event,
+      eid,
+      timer: setTimeout(() => {
         this.pending.delete(event.sentenceId);
-        this.commitTranscript(event);
+        this.commitTranscript(event, eid);
       }, stabilizeMs),
-    );
+    });
   }
 
-  /** Append (or replace) the sentence in the rolling buffer, then fan out. */
-  private commitTranscript(event: TranscriptEvent): void {
-    const line = {
-      sentenceId: event.sentenceId,
-      speaker: event.speaker.name ?? event.speaker.id ?? '?',
-      text: event.text,
-      seq: ++this.seq,
-    };
-    // Same sentence growing -> replace in place, so the buffer holds one entry
-    // per sentence instead of every intermediate prefix. Keep the first arrival
-    // position so the sentence doesn't jump past chat sent while it was spoken.
-    const idx = this.transcript.findIndex((l) => l.sentenceId === event.sentenceId);
-    if (idx >= 0) this.transcript[idx] = { ...line, seq: this.transcript[idx]!.seq };
-    else this.transcript.push(line);
-    const keep = this.config.transcript.keep;
-    if (this.transcript.length > keep) this.transcript = this.transcript.slice(-keep);
-    this.emit(event);
+  /** Record an event id that produced no line, so a reload still knows it. */
+  private noteSeen(eid: string | undefined): void {
+    if (eid) this.transcriptLog?.append({ k: 'seen', seen: [eid] });
+  }
+
+  /** Commit what is still settling (no fan-out): the meeting is over or the process stops. */
+  private flushPending(): void {
+    for (const { timer, event, eid } of this.pending.values()) {
+      clearTimeout(timer);
+      this.commitTranscript(event, eid, false);
+    }
+    this.pending.clear();
+  }
+
+  /** Append (or replace) the sentence in the record, write it, then fan out. */
+  private commitTranscript(event: TranscriptEvent, eid: string | undefined, emit = true): void {
+    const speaker = event.speaker.name ?? event.speaker.id ?? '?';
+    // Same sentence growing -> replace in place, so the record holds one entry
+    // per sentence instead of every intermediate prefix. Keep the first time
+    // and position so the sentence doesn't jump past chat sent while it was spoken.
+    let line = this.bySentence.get(event.sentenceId);
+    if (line) {
+      line.text = event.text;
+      line.speaker = speaker;
+      if (eid) line.eid = eid;
+    } else {
+      line = this.addLine({
+        kind: 'speech',
+        sentenceId: event.sentenceId,
+        speaker,
+        ...(event.speaker.id ? { speakerId: event.speaker.id } : {}),
+        text: event.text,
+        at: event.atMs ?? this.now(),
+        seq: ++this.seq,
+        ...(eid ? { eid } : {}),
+      });
+    }
+    this.persistLine(line, eid);
+    if (emit) this.emit(event);
   }
 
   private emit(event: MeetingEvent): void {
@@ -346,10 +628,128 @@ export class MeetingSession {
         ...(this.cursor ? { pageToken: this.cursor } : {}),
       });
       if (page.pageToken) this.cursor = page.pageToken;
-      for (const item of page.items) this.ingest(item);
+      for (const item of page.items) this.ingest(item, { quiet: true });
       if (!page.hasMore) return;
     }
     log.warn('meeting', 'catchup-truncated', { meetingId: this.meetingId, pages: maxPages });
+  }
+
+  /**
+   * Re-read the meeting's events from the very first page and keep whatever
+   * the live lanes missed (quietly: no answers to old questions, no alerts).
+   * The poller's cursor is left alone. Concurrent calls share one run.
+   * Resolves to the number of lines recovered; a `122001` ends the session
+   * like the poller would; other errors are logged and resolve to 0.
+   */
+  backfill(reason: string, maxPages = 1000): Promise<number> {
+    if (this.backfillRun) return this.backfillRun;
+    if (this.ended) return Promise.resolve(0);
+    this.lastBackfillAt = this.now();
+    const run = (async (): Promise<number> => {
+      const before = this.backfilled;
+      let token: string | undefined;
+      let pages = 0;
+      try {
+        for (; pages < maxPages; ) {
+          const page = await fetchMeetingEvents(this.client, {
+            meetingId: this.meetingId,
+            ...(token ? { pageToken: token } : {}),
+          });
+          pages += 1;
+          this.quietGain = 0;
+          for (const item of page.items) this.ingest(item, { quiet: true });
+          this.backfilled += this.quietGain;
+          // Stop on the last page, and on a cursor that does not move (no loop).
+          if (!page.hasMore || !page.pageToken || page.pageToken === token) break;
+          token = page.pageToken;
+        }
+      } catch (err) {
+        if (err instanceof VcApiError && err.meetingGone) {
+          this.gone(err);
+        } else {
+          log.warn('meeting', 'backfill-failed', { meetingId: this.meetingId, reason, err: String(err) });
+        }
+      }
+      this.backfills += 1;
+      const added = this.backfilled - before;
+      log.info('meeting', 'backfill', { meetingId: this.meetingId, reason, pages, added });
+      return added;
+    })();
+    this.backfillRun = run.finally(() => {
+      this.backfillRun = undefined;
+    });
+    return this.backfillRun;
+  }
+
+  /**
+   * Re-read soon, unless one ran recently or one is already scheduled. Timers
+   * die with the session ({@link stopTimers}).
+   */
+  private scheduleBackfill(reason: string, delayMs: number): void {
+    if (this.stopped || this.ended || this.backfillTimer) return;
+    const wait = Math.max(delayMs, this.lastBackfillAt + BACKFILL_MIN_GAP_MS - this.now());
+    this.backfillTimer = setTimeout(() => {
+      this.backfillTimer = undefined;
+      void this.backfill(reason);
+    }, wait);
+    this.backfillTimer.unref?.();
+  }
+
+  /**
+   * Start the periodic full re-read (every {@link FULL_BACKFILL_INTERVAL_MS}).
+   * The manager calls this next to {@link startPolling}.
+   */
+  startBackfill(): void {
+    if (this.stopped || this.ended) return;
+    const tick = () => {
+      this.periodic = undefined;
+      if (this.stopped || this.ended) return;
+      void this.backfill('periodic').finally(() => {
+        if (this.stopped || this.ended) return;
+        this.periodic = setTimeout(tick, FULL_BACKFILL_INTERVAL_MS);
+        this.periodic.unref?.();
+      });
+    };
+    this.periodic = setTimeout(tick, FULL_BACKFILL_INTERVAL_MS);
+    this.periodic.unref?.();
+  }
+
+  /** The events API answered "meeting over": stop, and let the manager wrap up. */
+  private gone(err: VcApiError): void {
+    if (this.ended) return;
+    log.info('meeting', 'ended-observed', { meetingId: this.meetingId, code: err.code });
+    this.markEnded();
+    this.onGone?.(err);
+  }
+
+  /**
+   * Compact the transcript file to its final state and write the readable
+   * `.txt` next to it. Returns the `.txt` path, or undefined when saving is off
+   * or failed. Safe to call more than once.
+   */
+  finalizeTranscript(): string | undefined {
+    if (!this.transcriptLog || !this.textFile) return undefined;
+    const ordered = this.ordered();
+    const lines: TranscriptLine[] = ordered.map((l) => ({
+      k: l.kind,
+      ...(l.sentenceId ? { sid: l.sentenceId } : {}),
+      who: l.speaker,
+      ...(l.speakerId ? { whoId: l.speakerId } : {}),
+      text: l.text,
+      at: l.at,
+      ...(l.eid ? { eid: l.eid } : {}),
+    }));
+    // Every id seen stays in the file: the bot may join this meeting again,
+    // and a new session reading from the first page must not take old events
+    // for new ones (re-answering old questions, rolling sentences back).
+    const records: TranscriptRecord[] = [...lines, { k: 'seen', seen: [...this.seenEvents] }];
+    const text = renderTranscriptText({ meetingNo: this.meetingNo, ...(this.topic ? { topic: this.topic } : {}) }, lines);
+    const out = this.transcriptLog.finalize(records, this.textFile, text);
+    if (out) {
+      this.savedText = out;
+      log.info('meeting', 'transcript-saved', { meetingId: this.meetingId, lines: lines.length });
+    }
+    return out;
   }
 
   /**
@@ -366,16 +766,16 @@ export class MeetingSession {
           ...(this.cursor ? { pageToken: this.cursor } : {}),
         });
         this.pollFailures = 0;
+        this.polled += page.items.length;
         if (page.pageToken) this.cursor = page.pageToken;
-        for (const item of page.items) this.ingest(item);
+        const gapFill = this.source === 'push';
+        for (const item of page.items) this.ingest(item, { gapFill });
         this.idleRounds = page.items.length > 0 ? 0 : Math.min(this.idleRounds + 1, 3);
         // More pages queued → come back immediately instead of sleeping.
         if (page.hasMore) this.idleRounds = -1;
       } catch (err) {
         if (err instanceof VcApiError && err.meetingGone) {
-          log.info('meeting', 'ended-observed', { meetingId: this.meetingId, code: err.code });
-          this.markEnded();
-          this.onGone?.(err);
+          this.gone(err);
           return;
         }
         this.idleRounds = Math.min(this.idleRounds + 1, 3);
@@ -387,7 +787,12 @@ export class MeetingSession {
       }
       if (this.stopped || this.ended) return;
       const base = this.config.pollIntervalMs;
-      const delay = this.idleRounds < 0 ? 0 : Math.min(base * 2 ** this.idleRounds, 10_000);
+      const delay =
+        this.idleRounds < 0
+          ? 0
+          : this.source === 'push'
+            ? GAP_FILL_INTERVAL_MS
+            : Math.min(base * 2 ** this.idleRounds, 10_000);
       this.poller = setTimeout(() => void tick(), delay);
     };
     this.poller = setTimeout(() => void tick(), 0);
@@ -407,8 +812,12 @@ export class MeetingSession {
   private stopTimers(): void {
     this.stopped = true;
     this.stopPolling();
-    for (const timer of this.pending.values()) clearTimeout(timer);
-    this.pending.clear();
+    if (this.backfillTimer) clearTimeout(this.backfillTimer);
+    this.backfillTimer = undefined;
+    if (this.periodic) clearTimeout(this.periodic);
+    this.periodic = undefined;
+    // Sentences still settling are part of the meeting: keep them.
+    this.flushPending();
   }
 
   /** Leave the meeting. Idempotent — safe to call after the meeting ended. */
@@ -428,6 +837,10 @@ export class MeetingSession {
     this.stopTimers();
     this.handlers.clear();
   }
+}
+
+function formatLine(l: MeetingLine): string {
+  return l.kind === 'chat' ? `${l.speaker}（弹幕）: ${l.text}` : `${l.speaker}: ${l.text}`;
 }
 
 /**

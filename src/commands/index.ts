@@ -80,9 +80,9 @@ import { validateAppCredentials } from '../utils/feishu-auth';
 import type { WorkspaceStore } from '../workspace/store';
 import { createBoundChat, defaultChatName } from '../bot/group';
 import { fetchKnownChats, type KnownChat } from '../bot/lark-info';
-import { describeMeetingError, type MeetingManager } from '../meeting/manager';
+import { describeMeetingError, type MeetingManager, type PushDiagnosis } from '../meeting/manager';
 import { extractMeetingNo } from '../meeting/api';
-import { answerInMeeting, meetingScopeId } from '../meeting/orchestrator';
+import { answerInMeeting, meetingScopeId, summarizeMeetingRecord } from '../meeting/orchestrator';
 import { meetingAuthzSummary } from '../meeting/authz';
 import type { MeetingSession } from '../meeting/session';
 import { handleMeetingTodo } from '../meeting/minutes';
@@ -2209,6 +2209,8 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
         await reply(ctx, picked.message);
         return;
       }
+      // The last re-read before leaving can take a few seconds.
+      await reply(ctx, '正在补齐整场记录，然后离会…');
       await manager.leave(picked.session.meetingId);
       await reply(ctx, `✅ 已离会（会议号 ${picked.session.meetingNo}）`);
       return;
@@ -2231,14 +2233,22 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
         );
         return;
       }
-      const tail = lines.slice(-30);
+      // Time-labelled, like the minutes see it; in-meeting answers get the
+      // last `transcript.keep` lines of the same record.
+      const full = picked.session.fullContext();
+      const tail = full.slice(-30);
+      const st = picked.session.status();
+      const keep = ctx.controls.profileConfig.meeting.transcript.keep;
       await reply(
         ctx,
         [
-          `会议记录（字幕 + 弹幕）共 ${lines.length} 条${tail.length < lines.length ? `，以下是最近 ${tail.length} 条` : ''}：`,
+          `会议记录（字幕 + 弹幕）共 ${full.length} 条，纪要用全部；会中回答用最近 ${Math.min(keep, full.length)} 条${tail.length < full.length ? `。以下是最近 ${tail.length} 条` : ''}：`,
           '```',
           ...tail,
           '```',
+          st.transcriptFile
+            ? `全量逐字稿在本机：${st.transcriptFile}（散会后同目录生成可读的 .txt）`
+            : '全量逐字稿没有落盘（`meeting.transcript.save` 已关闭）。',
         ].join('\n'),
       );
       return;
@@ -2289,10 +2299,7 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
         return;
       }
       const session = picked.session;
-      const question =
-        sub === 'notes'
-          ? '请基于以上会议字幕做一份简洁纪要：讨论了什么、结论、待办（如有）。'
-          : rest;
+      const question = sub === 'notes' ? 'notes' : rest;
       if (!question) {
         await reply(ctx, '用法：`/meeting ask <问题>`');
         return;
@@ -2303,22 +2310,23 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
       }
       await reply(ctx, sub === 'notes' ? '正在总结会议…' : '正在思考…');
       try {
-        const answer = await answerInMeeting(
-          {
-            session,
-            channel: ctx.channel,
-            controls: ctx.controls,
-            executor: ctx.runExecutor,
-            activeRuns: ctx.activeRuns,
-            sessions: ctx.sessions,
-            ...(ctx.sessionCatalog ? { sessionCatalog: ctx.sessionCatalog } : {}),
-            workspaces: ctx.workspaces,
-          },
-          question,
-          // Typed privately -> answer only to the caller. Broadcasting a
-          // summary somebody asked for in a DM would surprise the meeting.
-          { deliver: 'caller' },
-        );
+        const deps = {
+          session,
+          channel: ctx.channel,
+          controls: ctx.controls,
+          executor: ctx.runExecutor,
+          activeRuns: ctx.activeRuns,
+          sessions: ctx.sessions,
+          ...(ctx.sessionCatalog ? { sessionCatalog: ctx.sessionCatalog } : {}),
+          workspaces: ctx.workspaces,
+        };
+        // Typed privately -> answer only to the caller. Broadcasting a
+        // summary somebody asked for in a DM would surprise the meeting.
+        // Notes cover the whole meeting so far, like the minutes do.
+        const answer =
+          sub === 'notes'
+            ? await summarizeMeetingRecord(deps, 'notes')
+            : await answerInMeeting(deps, question, { deliver: 'caller' });
         await reply(ctx, answer || '（没有产生回答）');
       } catch (err) {
         await reply(ctx, `执行失败：${describeMeetingError(err)}`);
@@ -2333,9 +2341,9 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
           '`/meeting` — 状态',
           '`/meeting join <9位会议号>` — 让 bot 入会',
           '`/meeting leave [会议号]` — 离会',
-          '`/meeting notes [会议号]` — 基于字幕做纪要（只发给你）',
+          '`/meeting notes [会议号]` — 基于整场字幕和弹幕做纪要（只发给你）',
           '`/meeting stop [会议号]` — 中断该会议卡住的任务',
-          '`/meeting transcript [会议号]` — 看 agent 实际拿到的字幕和弹幕上下文',
+          '`/meeting transcript [会议号]` — 看记下的字幕和弹幕（全量逐字稿存在本机）',
           '`/meeting ask <问题>` — 带会议上下文提问',
           '`/meeting doc <飞书文档链接> [会议号]` — 绑定会前资料（也可以直接发「会前资料 <链接>」）',
           '`/meeting docs` — 看各场会绑定了哪些资料、哪个版本',
@@ -2389,12 +2397,41 @@ function pickMeetingSession(
   };
 }
 
+/**
+ * One line on whether meeting events are pushed. The point is to tell "the
+ * app is not subscribed" (fix it in the developer console) from "subscribed,
+ * there just hasn't been a meeting" (nothing to fix).
+ */
+export function pushStatusLine(d: PushDiagnosis): string {
+  switch (d.state) {
+    case 'unhooked':
+      return `推送：未挂载（${d.reason}），只靠轮询`;
+    case 'ok':
+      return `推送：正常，本次启动后收到 ${d.received} 条${d.lastAt ? `（最近 ${shortClock(d.lastAt)}）` : ''}`;
+    case 'not-subscribed':
+      return d.evidence === 'console'
+        ? `推送：**没订阅事件**——开放平台显示本应用没订阅 ${d.missing.join('、')}。到开发者后台「事件与回调」用长连接订阅后发布新版本；在那之前只靠轮询（能用，慢几秒）。`
+        : `推送：**多半没订阅事件**——本次启动后轮询已从会里拉到 ${d.polled} 条事件，推送一条都没收到。到开发者后台「事件与回调」检查 vc.bot.* 三个事件（长连接方式）并发布；在那之前只靠轮询。`;
+    case 'subscribed-no-push':
+      return `推送：开放平台显示已订阅，但这次启动后还没收到推送（轮询拉到 ${d.polled} 条）。刚入会时正常；一直这样就检查订阅方式是不是「长连接」、改完有没有发布新版本。现在靠轮询，能用，慢几秒`;
+    case 'subscribed-idle':
+      return '推送：已订阅，本次启动后还没开过会（没会就不会有推送，正常）';
+    case 'waiting':
+      return '推送：已挂载，会里还没有任何事件（推送和轮询都没收到）——确认有人说话或发消息、会议开了字幕';
+    case 'unknown':
+      return `推送：本次启动后还没开过会，判断不了有没有订阅（读不到应用的事件订阅：${d.reason}）。入会后再看这里`;
+  }
+}
+
+function shortClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '?';
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
 async function replyMeetingStatus(ctx: CommandContext, manager: MeetingManager): Promise<void> {
   const sessions = manager.list();
-  const push = manager.pushHealth();
-  const pushLine = push.hooked
-    ? `推送：已挂载，累计收到 ${push.received} 条${push.received === 0 ? '（尚未收到，可能还没在后台订阅 vc.bot.* 事件）' : ''}`
-    : `推送：未挂载（${push.reason ?? '未知原因'}），仅靠轮询`;
+  const pushLine = pushStatusLine(await manager.diagnosePush());
   // Lets an admin confirm the in-meeting gate without opening the config file.
   const authzLine = meetingAuthzSummary(ctx.controls.profileConfig);
   const alerts = ctx.controls.profileConfig.meeting.alerts;
@@ -2413,7 +2450,8 @@ async function replyMeetingStatus(ctx: CommandContext, manager: MeetingManager):
   const lines = sessions.map(
     (s) =>
       `- **${s.topic ?? s.meetingNo}**（${s.meetingNo}）· 来源 ${s.source === 'push' ? '推送' : '轮询'}` +
-      ` · 字幕 ${s.transcriptLines} 条 · 参会 ${s.participants} 人` +
+      ` · 字幕 ${s.transcriptLines} 条 · 弹幕 ${s.chatLines} 条 · 参会 ${s.participants} 人` +
+      (s.backfilled ? ` · 补回 ${s.backfilled} 条` : '') +
       (s.deniedCount ? ` · 拒绝 ${s.deniedCount} 次` : '') +
       (s.alertHits ? ` · 提醒 ${s.alertHits} 次` : ''),
   );

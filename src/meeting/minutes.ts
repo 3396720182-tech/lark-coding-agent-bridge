@@ -12,21 +12,31 @@ import { meetingDataDir, readMeetingJson, writeMeetingJson } from './store';
  * todo into a Larkyard ticket (`/meeting todo <archive>#<n>`, admin-only via
  * the `/meeting` gate).
  *
- * The archive keeps the minutes and the todos only — never transcript or chat
- * text. Keeping a verbatim record is a data-retention decision of its own.
+ * The archive keeps the minutes and the todos; the verbatim record is the
+ * transcript file (`transcript-log.ts`), referenced by path.
  */
 
 /** Longer minutes are cut in the card; the archive keeps the full text. */
 export const MINUTES_MAX_CHARS = 8000;
 export const MAX_TODOS = 20;
 
-export const MEETING_MINUTES_QUESTION = [
-  '会议已结束。请基于以上会议记录（字幕和弹幕）写一份会议纪要，分三部分：**讨论要点**、**结论**、**待办**。',
-  '待办写清做什么、负责人、截止时间；记录里没提到的写「未明确」，不要编。',
-  '纪要正文写完后，另起一行输出一个 ```json 代码块，只放待办，格式：',
-  '{"todos":[{"task":"做什么","owner":"负责人，没有就空字符串","due":"截止时间，没有就空字符串"}]}',
-  '没有待办就输出 {"todos":[]}。代码块之后不要再写任何内容。',
-].join('\n');
+/**
+ * The end-of-meeting ask. `fromSegments`: the context is per-segment summaries
+ * of a long meeting rather than the record itself.
+ */
+export function meetingMinutesQuestion(fromSegments = false): string {
+  return [
+    fromSegments
+      ? '会议已结束。请把以上分段摘要合并成整场会议纪要，分三部分：**讨论要点**、**结论**、**待办**。各段重复的内容合并，前后矛盾的以后面的为准。'
+      : '会议已结束。请基于以上会议记录（字幕和弹幕）写一份会议纪要，分三部分：**讨论要点**、**结论**、**待办**。',
+    '待办写清做什么、负责人、截止时间；记录里没提到的写「未明确」，不要编。',
+    '纪要正文写完后，另起一行输出一个 ```json 代码块，只放待办，格式：',
+    '{"todos":[{"task":"做什么","owner":"负责人，没有就空字符串","due":"截止时间，没有就空字符串"}]}',
+    '没有待办就输出 {"todos":[]}。代码块之后不要再写任何内容。',
+  ].join('\n');
+}
+
+export const MEETING_MINUTES_QUESTION = meetingMinutesQuestion(false);
 
 export interface MeetingTodo {
   task: string;
@@ -56,6 +66,8 @@ export interface MinutesRecord {
   todos: MeetingTodo[];
   /** Documents bound to this meeting (empty when none). */
   docs?: MinutesDocRef[];
+  /** The readable full transcript on this machine, when it was saved. */
+  transcript?: string;
 }
 
 /**
@@ -156,6 +168,10 @@ export function meetingMinutesCard(rec: MinutesRecord, notes: string[], archived
       '会前资料：' +
         rec.docs.map((r) => `《${r.title}》r${r.revision}（${shortTime(r.fetchedAt)} 抓取）`).join('、'),
     );
+  }
+  if (rec.transcript) {
+    // Only the tail: the full path names the user's home directory.
+    foot.push(`全量逐字稿已存本机：${rec.transcript.split(/[\\/]/).slice(-3).join('/')}`);
   }
   if (archived) foot.push(`存档 ${rec.id}`);
   if (foot.length) elements.push({ tag: 'markdown', content: foot.join('\n'), text_size: 'notation' });

@@ -13,7 +13,7 @@ import { describeMeetingError } from './manager';
 import { attachMeetingAlerts } from './alerts';
 import { meetingAuthzGate, meetingEffectiveAccess, meetingReadOnlyAccess } from './authz';
 import type { MeetingSession } from './session';
-import type { AccessMode, MeetingSummaryTarget } from '../config/profile-schema';
+import type { AccessMode, MeetingSummaryTarget, ProfileConfig } from '../config/profile-schema';
 import type { ChatEvent, MeetingEvent } from './types';
 import {
   adoptPendingDocsOnJoin,
@@ -30,6 +30,7 @@ import {
 } from './docs';
 import {
   MEETING_MINUTES_QUESTION,
+  meetingMinutesQuestion,
   meetingArchiveFile,
   meetingArchiveId,
   meetingMinutesCard,
@@ -237,12 +238,50 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
       log.warn('meeting', 'answer-failed', { meetingId: session.meetingId, err: String(err) }),
     );
   });
+  // Say who we are on arrival — not again when a restart re-adopts the meeting.
+  if (!session.resumedAt && controls.profileConfig.meeting.announceOnJoin) {
+    const text = meetingJoinNotice(controls.profileConfig, deps.channel.botIdentity?.name);
+    void session
+      .sendMessage(text)
+      .then(() => log.info('meeting', 'join-notice-sent', { meetingId: session.meetingId }))
+      .catch((err) =>
+        log.warn('meeting', 'join-notice-failed', { meetingId: session.meetingId, err: describeMeetingError(err) }),
+      );
+  }
   // Additional subscriber: session.on keeps a Set per kind.
   attachMeetingAlerts(deps);
   // Pre-meeting docs: take the ones waiting for this meeting, and bind docs
   // shared on screen in the meeting.
   adoptPendingDocsOnJoin(deps);
   attachShareDocs(deps);
+}
+
+/**
+ * The notice posted in the meeting chat on joining: who the bot is, that it is
+ * recording, how to ask it, and who may. Disclosure first — participants see a
+ * bot in the list but not what it does with what it hears.
+ */
+export function meetingJoinNotice(profile: ProfileConfig, botName?: string): string {
+  const m = profile.meeting;
+  const name = botName?.trim() || 'AI 会议助手';
+  const ask = triggerPrefixes(m.trigger, botName)[botName ? 1 : 0] ?? m.trigger;
+  // Team mode lets anyone in the meeting drive it (canUseDm), outsiders included.
+  const who =
+    m.access === 'admins-only'
+      ? '目前只有机器人的主人和管理员能让我执行，其他人发了不会执行'
+      : profile.mode === 'team'
+        ? '会里的每个人都可以问我'
+        : '目前只有机器人的主人和授权名单里的人能让我执行，其他人发了不会执行';
+  const where =
+    m.respondIn === 'im' ? '回答会发到发起入会的聊天里' : m.respondIn === 'both' ? '回答发在这里，也会发到发起入会的聊天里' : '我会回在这里';
+  const lines = [
+    botName?.trim() ? `👋 我是「${name}」，AI 会议助手，已加入本场会议。` : `👋 我是 AI 会议助手，已加入本场会议。`,
+    `· 我在记录本场的字幕和会中聊天（带发言人和时间），用来回答问题${m.summaryOnEnd ? '，散会后整理成纪要' : ''}。`,
+    `· 有问题在聊天里发「${ask} 你的问题」，${where}。`,
+    `· ${who}。`,
+    '· 不希望被记录，可以请主持人把我移出会议。',
+  ];
+  return lines.join('\n');
 }
 
 export interface AnswerOptions {
@@ -267,9 +306,16 @@ export interface AnswerOptions {
   elevate?: boolean;
   /**
    * `minutes`: the end-of-meeting summary. Not bound by the in-meeting length
-   * limit, given the doc list instead of doc chunks, and not logged as Q&A.
+   * limit, given the doc list instead of doc chunks, not logged as Q&A, and
+   * run in its own agent scope (an in-meeting run still going must not block
+   * it, and a rejection is an error rather than an answer).
    */
   purpose?: 'minutes';
+  /**
+   * The meeting record to give instead of the last `transcript.keep` lines:
+   * the whole meeting (`full`) or per-segment summaries of it (`segments`).
+   */
+  context?: { kind: 'full' | 'segments'; lines: string[] };
 }
 
 /**
@@ -283,11 +329,12 @@ export async function answerInMeeting(
 ): Promise<string> {
   const { session, controls } = deps;
   const config = controls.profileConfig.meeting;
-  const transcript = session.recentContext(config.transcript.keep);
+  const transcript = opts.context?.lines ?? session.recentContext(config.transcript.keep);
   const docs = meetingDocContext(deps, question, transcript, opts.purpose);
   const prompt = buildMeetingPrompt({
     question,
     transcript,
+    ...(opts.context ? { contextKind: opts.context.kind } : {}),
     topic: session.topic,
     ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
     ...(opts.purpose ? { purpose: opts.purpose } : {}),
@@ -300,7 +347,12 @@ export async function answerInMeeting(
     opts.deliver === 'broadcast'
       ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
       : meetingReadOnlyAccess(controls.profileConfig);
-  const answer = await runMeetingAgent(deps, prompt, opts.usedPrefix, opts.elevate === true, tier);
+  const answer = await runMeetingAgent(deps, prompt, {
+    ...(opts.usedPrefix ? { usedPrefix: opts.usedPrefix } : {}),
+    elevate: opts.elevate === true,
+    tier,
+    ...(opts.purpose === 'minutes' ? { minutes: true } : {}),
+  });
   if (!answer) return '';
   // Which of the provided chunks the answer actually cites — those are its
   // grounds; citations matching nothing provided are logged as unverified.
@@ -346,6 +398,11 @@ export async function answerInMeeting(
 export interface MeetingPromptInput {
   question: string;
   transcript: string[];
+  /**
+   * What `transcript` holds: the latest lines (default), the whole meeting
+   * with time labels, or per-segment summaries of a long meeting.
+   */
+  contextKind?: 'recent' | 'full' | 'segments';
   topic?: string;
   askedBy?: string;
   purpose?: 'minutes';
@@ -358,12 +415,23 @@ export interface MeetingPromptInput {
 /** Compose the agent prompt: meeting context first, then the actual ask. */
 export function buildMeetingPrompt(input: MeetingPromptInput): string {
   const parts: string[] = [];
-  parts.push('你正在参加一场飞书视频会议，以下是会议的实时字幕和会中弹幕（标「弹幕」的是文字消息）。');
+  const kind = input.contextKind ?? 'recent';
+  if (kind === 'segments') {
+    parts.push('你参加了一场飞书视频会议。会议很长，记录已按时间分段整理成摘要，以下是各段摘要。');
+  } else {
+    parts.push('你正在参加一场飞书视频会议，以下是会议的实时字幕和会中弹幕（标「弹幕」的是文字消息）。');
+  }
   if (input.topic) parts.push(`会议主题：${input.topic}`);
   parts.push('');
-  parts.push('=== 会议记录（按时间顺序，可能不完整） ===');
+  parts.push(
+    kind === 'segments'
+      ? '=== 分段摘要（按时间顺序） ==='
+      : kind === 'full'
+        ? '=== 会议记录（整场，按时间顺序，方括号里是时间） ==='
+        : '=== 会议记录（按时间顺序，可能不完整） ===',
+  );
   parts.push(input.transcript.length ? input.transcript.join('\n') : '（暂无字幕和弹幕）');
-  parts.push('=== 记录结束 ===');
+  parts.push(kind === 'segments' ? '=== 摘要结束 ===' : '=== 记录结束 ===');
   if (input.materials?.length) {
     parts.push('');
     parts.push('=== 会前资料（按和问题的相关度摘录，方括号里是出处） ===');
@@ -455,7 +523,7 @@ async function summarize(deps: MeetingAgentDeps): Promise<void> {
   if (!controls.profileConfig.meeting.summaryOnEnd) return;
 
   const transcriptLines = session.transcriptLineCount();
-  const context = session.recentContext();
+  const context = session.fullContext();
   if (context.length === 0) {
     log.info('meeting', 'summary-skipped', { meetingId: session.meetingId, reason: 'empty-transcript' });
     notifyMeetingOwner(
@@ -475,11 +543,8 @@ async function summarize(deps: MeetingAgentDeps): Promise<void> {
     return;
   }
 
-  // deliver:'caller' — the meeting is over, so never try the in-meeting lane.
-  const answer = await answerInMeeting(deps, MEETING_MINUTES_QUESTION, {
-    deliver: 'caller',
-    purpose: 'minutes',
-  }).catch((err) => {
+  // Never the in-meeting lane: the meeting is over.
+  const answer = await summarizeMeetingRecord(deps, 'minutes').catch((err) => {
     log.warn('meeting', 'summary-run-failed', { meetingId: session.meetingId, err: String(err) });
     notifyMeetingOwner(deps, 'summary-run-failed', `会议已结束，但生成纪要失败：${String(err)}`);
     return '';
@@ -489,7 +554,6 @@ async function summarize(deps: MeetingAgentDeps): Promise<void> {
     return;
   }
 
-  const title = session.topic ?? session.meetingNo;
   const notes: string[] = [];
   if (transcriptLines === 0) notes.push('本场没收到字幕（可能没开转写），以上纪要只基于会中弹幕。');
   if (session.resumedAt) {
@@ -498,8 +562,16 @@ async function summarize(deps: MeetingAgentDeps): Promise<void> {
       minute: '2-digit',
       hour12: false,
     });
-    notes.push(`bridge 在 ${hhmm} 重启后接回本场会议，此前的部分内容可能缺失。`);
+    // With the transcript on disk, a restart loses at most what was said
+    // while the bridge was down — and the catch-up re-read usually has that.
+    notes.push(
+      session.status().transcriptFile
+        ? `bridge 在 ${hhmm} 重启后接回本场会议，重启期间的内容已从会议事件补回，个别语句可能缺失。`
+        : `bridge 在 ${hhmm} 重启后接回本场会议，此前的部分内容可能缺失。`,
+    );
   }
+  const backfilled = session.status().backfilled;
+  if (backfilled > 0) notes.push(`会中实时漏收的 ${backfilled} 条记录，已靠重新拉取整场事件补回。`);
   const sent = await deliverMeetingMinutes(deps, target, answer, notes);
   if (!sent) return;
   log.info('meeting', 'summary-sent', {
@@ -550,6 +622,7 @@ async function deliverMeetingMinutes(
     todosParsed: split.parsed,
     todos: split.todos,
     docs,
+    ...(session.status().transcriptText ? { transcript: session.status().transcriptText } : {}),
   };
   let archived = false;
   if (dir) {
@@ -618,16 +691,125 @@ export function resolveSummaryTarget(
   return undefined;
 }
 
-/** Submit one run and drain it into a single answer string. */
-async function runMeetingAgent(
+/** Longest meeting record (chars) the minutes are written from in one pass. */
+export const MINUTES_SINGLE_PASS_CHARS = 60_000;
+/** Size of one segment when the record is longer: summarized first, then merged. */
+export const MINUTES_SEGMENT_CHARS = 30_000;
+
+/**
+ * Split the meeting record into segments of at most `max` characters, on line
+ * boundaries. A single line longer than that is cut. One segment when it all fits.
+ */
+export function splitMeetingRecord(lines: string[], max = MINUTES_SEGMENT_CHARS): string[][] {
+  const out: string[][] = [];
+  let cur: string[] = [];
+  let size = 0;
+  for (const raw of lines) {
+    const line = raw.length > max ? `${raw.slice(0, max - 1)}…` : raw;
+    if (cur.length && size + line.length + 1 > max) {
+      out.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(line);
+    size += line.length + 1;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+const recordChars = (lines: string[]): number => lines.reduce((n, l) => n + l.length + 1, 0);
+
+/** `[HH:mm:ss]` of a record line, for naming a segment. */
+const lineClock = (line: string | undefined): string => /^\[([0-9:-]+)\]/.exec(line ?? '')?.[1] ?? '?';
+
+/** The ask for one segment of a long meeting. */
+export function buildSegmentPrompt(input: {
+  topic?: string;
+  index: number;
+  total: number;
+  lines: string[];
+}): string {
+  const range = `${lineClock(input.lines[0])}–${lineClock(input.lines[input.lines.length - 1])}`;
+  return [
+    `你在帮忙整理一场飞书视频会议的纪要。会议很长，分成 ${input.total} 段处理，这是第 ${input.index} 段（${range}）。`,
+    ...(input.topic ? [`会议主题：${input.topic}`] : []),
+    '',
+    `=== 第 ${input.index} 段会议记录（方括号里是时间，标「弹幕」的是文字消息） ===`,
+    input.lines.join('\n'),
+    '=== 记录结束 ===',
+    '',
+    '请把这一段整理成要点摘要，最后会和其他段合并成整场纪要：',
+    '- 讨论了什么、谁的观点（保留关键数字、名字、时间点）',
+    '- 做了哪些决定',
+    '- 提到的待办：做什么、负责人、截止时间；没提到的写「未明确」',
+    '只依据这一段的记录，不要编。直接输出摘要，不要寒暄，不要写 json。',
+  ].join('\n');
+}
+
+/**
+ * Summarize the whole meeting record: in one pass when it fits
+ * {@link MINUTES_SINGLE_PASS_CHARS}, otherwise segment by segment and then
+ * merged. `minutes` is the end-of-meeting minutes (prose + todo json);
+ * `notes` is `/meeting notes` (a short summary for whoever asked). Read-only,
+ * own agent scope, never delivered anywhere — the caller does that. Throws when
+ * a step fails or comes back empty: half a meeting must not pass as minutes.
+ */
+export async function summarizeMeetingRecord(
   deps: MeetingAgentDeps,
-  prompt: string,
-  usedPrefix?: string,
-  elevate = false,
-  tier: AccessMode = meetingReadOnlyAccess(deps.controls.profileConfig),
+  kind: 'minutes' | 'notes',
 ): Promise<string> {
+  const { session } = deps;
+  const lines = session.fullContext();
+  let context: { kind: 'full' | 'segments'; lines: string[] } = { kind: 'full', lines };
+  if (recordChars(lines) > MINUTES_SINGLE_PASS_CHARS) {
+    const segments = splitMeetingRecord(lines);
+    log.info('meeting', 'minutes-segmented', { meetingId: session.meetingId, segments: segments.length, lines: lines.length });
+    const parts: string[] = [];
+    for (const [i, seg] of segments.entries()) {
+      const prompt = buildSegmentPrompt({
+        ...(session.topic ? { topic: session.topic } : {}),
+        index: i + 1,
+        total: segments.length,
+        lines: seg,
+      });
+      const part = await runMeetingAgent(deps, prompt, { minutes: true });
+      if (!part) throw new Error(`第 ${i + 1}/${segments.length} 段摘要没有返回内容`);
+      parts.push(`【第 ${i + 1} 段 · ${lineClock(seg[0])}–${lineClock(seg[seg.length - 1])}】\n${part}`);
+    }
+    context = { kind: 'segments', lines: parts };
+  }
+  const question =
+    kind === 'minutes'
+      ? meetingMinutesQuestion(context.kind === 'segments')
+      : `请基于以上${context.kind === 'segments' ? '分段摘要' : '会议记录'}做一份简洁纪要：讨论了什么、结论、待办（如有）。`;
+  return answerInMeeting(deps, question, { deliver: 'caller', purpose: 'minutes', context });
+}
+
+interface RunOptions {
+  usedPrefix?: string;
+  elevate?: boolean;
+  tier?: AccessMode;
+  /**
+   * Minutes work: runs in the meeting's minutes scope (not blocked by an
+   * in-meeting run that is still going) and a rejected run throws instead of
+   * coming back as an answer.
+   */
+  minutes?: boolean;
+}
+
+/** Scope for the minutes runs of a meeting — separate from in-meeting answers. */
+export function meetingMinutesScopeId(meetingId: string): string {
+  return `meeting:${meetingId}:minutes`;
+}
+
+/** Submit one run and drain it into a single answer string. */
+async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: RunOptions = {}): Promise<string> {
   const { session, controls } = deps;
-  const scopeId = meetingScopeId(session.meetingId);
+  const usedPrefix = opts.usedPrefix;
+  const elevate = opts.elevate === true;
+  const tier = opts.tier ?? meetingReadOnlyAccess(controls.profileConfig);
+  const scopeId = opts.minutes ? meetingMinutesScopeId(session.meetingId) : meetingScopeId(session.meetingId);
   const base =
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
@@ -674,6 +856,7 @@ async function runMeetingAgent(
       meetingId: session.meetingId,
       reason: result.rejectReason.code,
     });
+    if (opts.minutes) throw new Error(result.rejectReason.userVisible);
     // The generic "already running" text is a dead end inside a meeting, where
     // /stop isn't reachable — point at the in-meeting escape hatch instead.
     if (result.rejectReason.code === 'run-already-active') {
@@ -690,6 +873,7 @@ async function runMeetingAgent(
 
   let answer = '';
   let failed = false;
+  // Minutes must not be half an answer: an errored run throws (see below).
   try {
     for await (const event of result.execution.subscribe()) {
       const chunk = textOf(event);
@@ -711,6 +895,7 @@ async function runMeetingAgent(
       });
     }
   }
+  if (failed && opts.minutes) throw new Error('agent 运行出错，没有完整的结果');
   return answer.trim();
 }
 

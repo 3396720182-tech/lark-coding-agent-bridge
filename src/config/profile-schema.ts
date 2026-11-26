@@ -101,6 +101,12 @@ export interface MeetingConfig {
     keep: number;
     /** Debounce window (ms) before a sentence counts as final; 0 = emit every update. */
     stabilizeMs: number;
+    /**
+     * Write the full transcript (speech + chat, speaker, time) under
+     * `<profileDir>/meeting-data/transcripts/`. On by default: without it the
+     * minutes of a long meeting and anything before a restart are lost.
+     */
+    save: boolean;
   };
   /** Where answers go. */
   respondIn: MeetingRespondIn;
@@ -134,6 +140,12 @@ export interface MeetingConfig {
   elevateWord: string;
   /** Literal keyword / speaker alerts on the transcript, DMed to the owner. */
   alerts: MeetingAlertsConfig;
+  /**
+   * Post a short notice in the meeting chat on joining: who the bot is, that
+   * it is recording, how to ask it, who may. Not repeated when a restarted
+   * bridge re-adopts the meeting.
+   */
+  announceOnJoin: boolean;
 }
 
 export type MeetingAccess = 'dm-policy' | 'admins-only';
@@ -444,7 +456,7 @@ function normalizeComments(_input: unknown): CommentConfig {
 export const MEETING_DEFAULTS: MeetingConfig = {
   enabled: false,
   autoJoinOnInvite: false,
-  transcript: { keep: 200, stabilizeMs: 0 },
+  transcript: { keep: 200, stabilizeMs: 0, save: true },
   respondIn: 'meeting',
   trigger: '@bot',
   pollIntervalMs: 3000,
@@ -457,6 +469,7 @@ export const MEETING_DEFAULTS: MeetingConfig = {
   elevateWord: '',
   // Empty lists = no alerts at all.
   alerts: { keywords: [], speakers: [], cooldownMs: 60_000, speakerCooldownMs: 300_000 },
+  announceOnJoin: true,
 };
 
 export const ATTACHMENT_BATCH_DEFAULTS = { batchThreshold: 3, batchKeep: 20 } as const;
@@ -465,7 +478,7 @@ function normalizeMeeting(input: unknown): MeetingConfig {
   const raw = (input && typeof input === 'object' ? input : {}) as {
     enabled?: unknown;
     autoJoinOnInvite?: unknown;
-    transcript?: { keep?: unknown; stabilizeMs?: unknown };
+    transcript?: { keep?: unknown; stabilizeMs?: unknown; save?: unknown };
     respondIn?: unknown;
     trigger?: unknown;
     pollIntervalMs?: unknown;
@@ -475,6 +488,7 @@ function normalizeMeeting(input: unknown): MeetingConfig {
     executionAccess?: unknown;
     elevateWord?: unknown;
     alerts?: unknown;
+    announceOnJoin?: unknown;
   };
   const trigger = typeof raw.trigger === 'string' && raw.trigger.trim() ? raw.trigger.trim() : MEETING_DEFAULTS.trigger;
   return {
@@ -484,6 +498,8 @@ function normalizeMeeting(input: unknown): MeetingConfig {
       keep: clampNumber(raw.transcript?.keep, 10, 2000, MEETING_DEFAULTS.transcript.keep),
       // 0 is meaningful here ("no debounce"), so it can't go through numberOr.
       stabilizeMs: clampNumber(raw.transcript?.stabilizeMs, 0, 30_000, MEETING_DEFAULTS.transcript.stabilizeMs),
+      // Only an explicit false turns it off.
+      save: raw.transcript?.save !== false,
     },
     respondIn:
       raw.respondIn === 'im' || raw.respondIn === 'both' || raw.respondIn === 'meeting'
@@ -503,6 +519,7 @@ function normalizeMeeting(input: unknown): MeetingConfig {
         ? raw.elevateWord.trim()
         : MEETING_DEFAULTS.elevateWord,
     alerts: normalizeMeetingAlerts(raw.alerts),
+    announceOnJoin: raw.announceOnJoin !== false,
   };
 }
 
