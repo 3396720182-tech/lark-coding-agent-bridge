@@ -226,7 +226,7 @@ describe('profile store canonical serialization', () => {
       enabled: true,
       respondIn: 'both',
       trigger: '@小助手',
-      transcript: { keep: 50, stabilizeMs: 800 },
+      transcript: { keep: 50, stabilizeMs: 800, save: false },
     };
 
     await saveRootConfig({
@@ -244,7 +244,7 @@ describe('profile store canonical serialization', () => {
       enabled: true,
       respondIn: 'both',
       trigger: '@小助手',
-      transcript: { keep: 50, stabilizeMs: 800 },
+      transcript: { keep: 50, stabilizeMs: 800, save: false },
     });
   });
 

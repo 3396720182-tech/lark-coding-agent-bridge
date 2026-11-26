@@ -58,7 +58,7 @@ function transcript(id: string, text: string): RawActivityItem {
 }
 
 function cfg(over: Partial<MeetingConfig> = {}): MeetingConfig {
-  return { ...MEETING_DEFAULTS, enabled: true, summaryOnEnd: true, ...over };
+  return { ...MEETING_DEFAULTS, enabled: true, summaryOnEnd: true, announceOnJoin: false, ...over };
 }
 
 function profileConfig(meeting: MeetingConfig) {
@@ -303,10 +303,11 @@ describe('meeting context = transcript + chat', () => {
     expect(s.recentContext(1)).toEqual(['甲: 周五上线']);
   });
 
-  it('caps the chat buffer at transcript.keep', () => {
+  it('keeps all chat; transcript.keep bounds the answer window', () => {
     const s = makeSession(cfg({ transcript: { ...MEETING_DEFAULTS.transcript, keep: 2 } }));
     for (let i = 0; i < 4; i++) s.ingest(chat(`c${i}`, `m${i}`));
-    expect(s.recentContext()).toEqual(['乙（弹幕）: m2', '乙（弹幕）: m3']);
+    expect(s.recentContext()).toHaveLength(4);
+    expect(s.recentContext(2)).toEqual(['乙（弹幕）: m2', '乙（弹幕）: m3']);
   });
 
   it('puts chat into the agent prompt', async () => {

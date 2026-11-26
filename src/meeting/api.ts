@@ -262,3 +262,49 @@ export async function fetchMeetingEvents(
     hasMore: data.has_more === true,
   };
 }
+
+/** What the app is subscribed to, as the Open Platform reports it. */
+export interface AppEventSubscription {
+  events: string[];
+  /** `subscription_type` as reported (long connection vs webhook), when present. */
+  mode?: string;
+}
+
+/**
+ * Read the app's own event subscriptions — the only way to tell "not
+ * subscribed" from "subscribed, but no meeting yet" before any push arrives.
+ * Tries the app info (`app.event.subscribed_events`), then the online version
+ * (`app_version.events`). Needs an app-info read scope; callers treat any
+ * failure as "unknown", never as "not subscribed".
+ */
+export async function fetchAppEventSubscription(
+  client: VcRequestClient,
+  appId: string,
+): Promise<AppEventSubscription> {
+  const id = encodeURIComponent(appId);
+  const info = await call<{
+    app?: {
+      online_version_id?: string;
+      event?: { subscription_type?: string; subscribed_events?: unknown };
+    };
+  }>(client, {
+    method: 'GET',
+    url: `/open-apis/application/v6/applications/${id}`,
+    params: { lang: 'zh_cn' },
+  });
+  const ev = info.app?.event;
+  const mode = typeof ev?.subscription_type === 'string' && ev.subscription_type ? ev.subscription_type : undefined;
+  if (Array.isArray(ev?.subscribed_events)) {
+    return { events: ev.subscribed_events.filter((e): e is string => typeof e === 'string'), ...(mode ? { mode } : {}) };
+  }
+  const versionId = info.app?.online_version_id;
+  if (!versionId) throw new Error('应用信息里没有事件订阅，也没有线上版本');
+  const ver = await call<{ app_version?: { events?: unknown } }>(client, {
+    method: 'GET',
+    url: `/open-apis/application/v6/applications/${id}/app_versions/${encodeURIComponent(versionId)}`,
+    params: { lang: 'zh_cn' },
+  });
+  const events = ver.app_version?.events;
+  if (!Array.isArray(events)) throw new Error('线上版本信息里没有事件列表');
+  return { events: events.filter((e): e is string => typeof e === 'string'), ...(mode ? { mode } : {}) };
+}

@@ -167,6 +167,7 @@ export function parseMeetingBody(body: unknown, current: MeetingConfig): Meeting
         t.stabilizeMs === undefined
           ? current.transcript.stabilizeMs
           : clampInt(t.stabilizeMs, 0, 30_000, current.transcript.stabilizeMs),
+      save: typeof t.save === 'boolean' ? t.save : current.transcript.save,
     },
     respondIn:
       fv.respondIn === 'meeting' || fv.respondIn === 'im' || fv.respondIn === 'both'
@@ -188,6 +189,7 @@ export function parseMeetingBody(body: unknown, current: MeetingConfig): Meeting
     executionAccess: current.executionAccess,
     elevateWord: current.elevateWord,
     alerts: current.alerts,
+    announceOnJoin: typeof fv.announceOnJoin === 'boolean' ? fv.announceOnJoin : current.announceOnJoin,
   };
 }
 

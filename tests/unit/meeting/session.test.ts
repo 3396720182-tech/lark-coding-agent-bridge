@@ -144,7 +144,7 @@ describe('MeetingSession ingest pipeline', () => {
 
   it('honours stabilizeMs: only the settled sentence is emitted', () => {
     vi.useFakeTimers();
-    const s = session(cfg({ transcript: { keep: 200, stabilizeMs: 800 } }));
+    const s = session(cfg({ transcript: { keep: 200, stabilizeMs: 800, save: false } }));
     const emitted: string[] = [];
     s.on('transcript', (e) => emitted.push(e.kind === 'transcript' ? e.text : ''));
 
@@ -157,12 +157,16 @@ describe('MeetingSession ingest pipeline', () => {
     expect(emitted).toEqual(['今天来讨论']); // settled once, final text only
   });
 
-  it('caps the rolling buffer at transcript.keep', () => {
-    const s = session(cfg({ transcript: { keep: 3, stabilizeMs: 0 } }));
+  it('keeps the whole meeting; transcript.keep only bounds the answer window', () => {
+    const s = session(cfg({ transcript: { keep: 3, stabilizeMs: 0, save: false } }));
     for (let i = 1; i <= 5; i++) {
       s.ingest(transcriptItem(`e${i}`, [{ sentence_id: i, text: `第${i}句`, speaker: { name: '甲' } }]));
     }
-    expect(s.recentTranscript()).toEqual(['甲: 第3句', '甲: 第4句', '甲: 第5句']);
+    // The minutes need the first half of a long meeting too.
+    expect(s.recentTranscript()).toHaveLength(5);
+    expect(s.status().transcriptLines).toBe(5);
+    expect(s.recentTranscript(3)).toEqual(['甲: 第3句', '甲: 第4句', '甲: 第5句']);
+    expect(s.recentContext(3)).toEqual(['甲: 第3句', '甲: 第4句', '甲: 第5句']);
   });
 
   it('tracks participants and exposes them in status', () => {
@@ -271,7 +275,7 @@ describe('MeetingSession ingest pipeline', () => {
     expect(seen).toEqual(['第一句', '第二句']);
   });
 
-  it('stops polling once push takes over, so events stop arriving twice', () => {
+  it('hands over to push idempotently (the poller stays on as a slow gap-fill)', () => {
     const s = session();
     s.startPolling();
     // Handing over is the point: both lanes carry the same content.

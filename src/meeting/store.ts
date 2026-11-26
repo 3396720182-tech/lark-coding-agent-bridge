@@ -5,8 +5,9 @@ import { log } from '../core/logger';
 
 /**
  * Files the meeting features keep across restarts: minutes archives, document
- * snapshots, document bindings, and the answer log. All live under
- * `<profileDir>/meeting-data/`; nothing here holds transcript or chat text.
+ * snapshots, document bindings, the answer log, and the full transcripts
+ * (`transcripts/`, see `transcript-log.ts`; off with `transcript.save: false`).
+ * All live under `<profileDir>/meeting-data/`.
  */
 export function meetingDataDir(controls: { configPath: string; profile: string }): string {
   const { profileDir } = resolveAppPaths({

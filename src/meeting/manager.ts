@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { log } from '../core/logger';
 import type { MeetingConfig } from '../config/profile-schema';
 import {
+  fetchAppEventSubscription,
   joinMeeting,
   MEETING_GONE_CODE,
   VcApiError,
@@ -48,6 +49,37 @@ export interface MeetingPushHealth {
   lastAt?: string;
 }
 
+/**
+ * What `/meeting status` says about push, from most to least certain.
+ *  - `unhooked`: the subscription could not even be installed (polling only).
+ *  - `ok`: pushes have arrived.
+ *  - `not-subscribed`: the Open Platform says the app does not subscribe to
+ *    the meeting events, or the poller has been fetching events while not a
+ *    single push came.
+ *  - `subscribed-idle`: subscribed (per the Open Platform), no meeting yet.
+ *  - `subscribed-no-push`: subscribed, events polled, no push yet (normal
+ *    right after joining a meeting in progress; persistent = wrong mode/unpublished).
+ *  - `waiting`: in a meeting, but nothing arrived on either lane yet.
+ *  - `unknown`: no meeting since start and the subscription can't be read.
+ */
+export type PushDiagnosis =
+  | { state: 'unhooked'; reason: string }
+  | { state: 'ok'; received: number; lastAt?: string }
+  | { state: 'not-subscribed'; evidence: 'console' | 'polled'; missing: string[]; polled: number }
+  | { state: 'subscribed-idle' }
+  | { state: 'subscribed-no-push'; polled: number }
+  | { state: 'waiting' }
+  | { state: 'unknown'; reason: string };
+
+/** A meeting followed for less than this doesn't count as "polled, never pushed". */
+const PUSH_GRACE_MS = 2 * 60_000;
+
+/** How long one subscription lookup is trusted. */
+const SUBSCRIPTION_TTL_MS = 10 * 60_000;
+
+/** A full re-read before leaving gets this long; leaving is not held up longer. */
+export const LEAVE_BACKFILL_TIMEOUT_MS = 20_000;
+
 export interface MeetingManagerDeps {
   client: VcRequestClient;
   /** Live config accessor — re-read per use so `/config` edits apply. */
@@ -74,6 +106,10 @@ export interface MeetingManagerDeps {
   stateFile?: string;
   /** A recorded meeting could not be re-adopted because it ended while the bridge was down. */
   onResumeEnded?: (meeting: PersistedMeeting, err: VcApiError) => void;
+  /** Where each meeting's full transcript is written (see `transcript-log.ts`). */
+  transcriptDir?: string;
+  /** This app's id: lets `/meeting status` read the app's event subscriptions. */
+  appId?: string;
 }
 
 /** One live meeting as written to {@link MeetingManagerDeps.stateFile}. */
@@ -100,11 +136,76 @@ export class MeetingManager {
   private disposed = false;
   /** Recorded meetings whose re-adoption failed transiently; kept for the next start. */
   private unresumed: PersistedMeeting[] = [];
+  /** Meetings followed since start, and events the poller fetched for ones that never got a push. */
+  private finished = { meetings: 0, polledWithoutPush: 0 };
+  private subscription?: { at: number; result: { events: string[] } | { error: string } };
+  /** Meetings in their last re-read before leaving (a second `leave` is a no-op). */
+  private leaving = new Set<string>();
 
   constructor(private deps: MeetingManagerDeps) {}
 
   pushHealth(): MeetingPushHealth {
     return { ...this.push };
+  }
+
+  /**
+   * Tell "not subscribed" from "subscribed but no meeting yet" (see
+   * {@link PushDiagnosis}). Reads the app's subscriptions from the Open
+   * Platform when it can (cached); otherwise falls back to what the live
+   * lanes have shown since start.
+   */
+  async diagnosePush(): Promise<PushDiagnosis> {
+    if (!this.push.hooked) return { state: 'unhooked', reason: this.push.reason ?? '未知原因' };
+    if (this.push.received > 0) {
+      return { state: 'ok', received: this.push.received, ...(this.push.lastAt ? { lastAt: this.push.lastAt } : {}) };
+    }
+    const live = [...this.sessions.values()];
+    const meetings = this.finished.meetings + live.length;
+    // A meeting joined moments ago has only polled its history so far; a push
+    // can't have arrived yet. Only count meetings followed for a while.
+    const settled = (s: MeetingSession) => Date.now() - Date.parse(s.startedAt) >= PUSH_GRACE_MS;
+    const polled =
+      this.finished.polledWithoutPush +
+      live.reduce((n, s) => n + (s.status().source === 'poll' && settled(s) ? s.status().polled : 0), 0);
+    const sub = await this.readSubscription();
+    if ('events' in sub) {
+      const missing = Object.values(VC_BOT_EVENTS).filter((e) => !sub.events.includes(e));
+      // The activity event is the one that matters; invited/ended are extras.
+      if (missing.includes(VC_BOT_EVENTS.activity)) {
+        return { state: 'not-subscribed', evidence: 'console', missing, polled };
+      }
+      // The Open Platform says subscribed: trust it over the heuristic.
+      if (polled > 0) return { state: 'subscribed-no-push', polled };
+    } else if (polled > 0) {
+      return { state: 'not-subscribed', evidence: 'polled', missing: [], polled };
+    }
+    if (meetings > 0) return { state: 'waiting' };
+    if ('events' in sub) return { state: 'subscribed-idle' };
+    return { state: 'unknown', reason: sub.error };
+  }
+
+  private async readSubscription(): Promise<{ events: string[] } | { error: string }> {
+    const appId = this.deps.appId;
+    if (!appId) return { error: '不知道本应用的 app_id' };
+    const cached = this.subscription;
+    if (cached && Date.now() - cached.at < SUBSCRIPTION_TTL_MS) return cached.result;
+    let result: { events: string[] } | { error: string };
+    try {
+      const sub = await fetchAppEventSubscription(this.deps.client, appId);
+      result = { events: sub.events };
+    } catch (err) {
+      result = { error: describeMeetingError(err) };
+      log.info('meeting', 'subscription-read-failed', { err: result.error });
+    }
+    this.subscription = { at: Date.now(), result };
+    return result;
+  }
+
+  /** Remember what an ending session showed, for {@link diagnosePush}. */
+  private noteFinished(session: MeetingSession): void {
+    const st = session.status();
+    this.finished.meetings += 1;
+    if (st.source === 'poll') this.finished.polledWithoutPush += st.polled;
   }
 
   list(): MeetingSessionStatus[] {
@@ -246,6 +347,10 @@ export class MeetingManager {
     session.markEnded();
     this.sessions.delete(meetingId);
     this.persist();
+    this.noteFinished(session);
+    // Compact the transcript and write the readable copy before the minutes
+    // run, so the minutes can point at it.
+    session.finalizeTranscript();
     this.deps.onEnded?.(session);
   }
 
@@ -272,11 +377,13 @@ export class MeetingManager {
       config,
       ...(botOpenId ? { botOpenId } : {}),
       ...(opts.originChatId ? { originChatId: opts.originChatId } : {}),
+      ...(this.deps.transcriptDir ? { transcriptDir: this.deps.transcriptDir } : {}),
     });
     this.sessions.set(session.meetingId, session);
     this.deps.onSession?.(session);
     session.onGone = () => this.endSession(session.meetingId, 'poll');
     session.startPolling();
+    session.startBackfill();
     this.persist();
     return session;
   }
@@ -331,6 +438,7 @@ export class MeetingManager {
         config: this.deps.config(),
         ...(botOpenId ? { botOpenId } : {}),
         ...(r.originChatId ? { originChatId: r.originChatId } : {}),
+        ...(this.deps.transcriptDir ? { transcriptDir: this.deps.transcriptDir } : {}),
       });
       try {
         await session.catchUp();
@@ -338,6 +446,9 @@ export class MeetingManager {
         session.dispose();
         if (err instanceof VcApiError && err.code === MEETING_GONE_CODE) {
           log.info('meeting', 'resume-dropped', { meetingNo: r.meetingNo, code: err.code });
+          // It ended while the bridge was down: what was recorded still gets
+          // its readable copy.
+          session.finalizeTranscript();
           settle(r);
           this.deps.onResumeEnded?.(r, err);
         } else {
@@ -359,6 +470,7 @@ export class MeetingManager {
       this.deps.onSession?.(session);
       session.onGone = () => this.endSession(session.meetingId, 'poll');
       session.startPolling();
+      session.startBackfill();
       log.info('meeting', 'resumed', { meetingNo: r.meetingNo, replayed: session.status().ingested });
     }
     this.persist();
@@ -390,14 +502,31 @@ export class MeetingManager {
     }
   }
 
-  /** Leave a meeting and drop its session. Idempotent. */
+  /**
+   * Leave a meeting and drop its session. Idempotent. Before leaving, the
+   * whole event stream is read once more (bounded by
+   * {@link LEAVE_BACKFILL_TIMEOUT_MS}): once the bot is out, the events API
+   * stops answering for this meeting.
+   */
   async leave(meetingId: string): Promise<boolean> {
     const session = this.sessions.get(meetingId);
-    if (!session) return false;
-    this.sessions.delete(meetingId);
-    this.persist();
-    await session.leave();
-    return true;
+    if (!session || this.leaving.has(meetingId)) return false;
+    this.leaving.add(meetingId);
+    try {
+      // Still a live session while reading: pushes keep landing and a crash
+      // here leaves a record to resume from.
+      await this.lastRead(session);
+      // The re-read may have found the meeting over (it then went through endSession).
+      if (this.sessions.get(meetingId) !== session) return true;
+      this.sessions.delete(meetingId);
+      this.persist();
+      this.noteFinished(session);
+      await session.leave();
+      session.finalizeTranscript();
+      return true;
+    } finally {
+      this.leaving.delete(meetingId);
+    }
   }
 
   /** Leave every meeting — used on `/exit` and process shutdown. */
@@ -405,7 +534,27 @@ export class MeetingManager {
     const all = [...this.sessions.values()];
     this.sessions.clear();
     this.persist();
-    await Promise.allSettled(all.map((s) => s.leave()));
+    // No last re-read here: this runs on shutdown, where every second counts.
+    await Promise.allSettled(
+      all.map(async (s) => {
+        this.noteFinished(s);
+        await s.leave();
+        s.finalizeTranscript();
+      }),
+    );
+  }
+
+  /** One last full re-read, never longer than {@link LEAVE_BACKFILL_TIMEOUT_MS}. */
+  private async lastRead(session: MeetingSession): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      session.backfill('leave').catch(() => 0),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, LEAVE_BACKFILL_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 
   /**
