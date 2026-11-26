@@ -94,7 +94,9 @@ describe('end-of-meeting minutes', () => {
     await summarizeEndedMeeting(args);
     const prompt = promptOf();
     expect(prompt).toContain('**讨论要点**、**结论**、**待办**');
-    expect(prompt).toContain('未明确');
+    expect(prompt).toContain('待确认');
+    expect(prompt).toContain('不要自己补');
+    expect(prompt).toContain('due_date');
     expect(prompt).toContain('```json');
     expect(prompt).not.toContain('200 字内');
   });

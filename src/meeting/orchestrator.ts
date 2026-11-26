@@ -11,6 +11,9 @@ import type { WorkspaceStore } from '../workspace/store';
 import { startRunFlow } from '../bot/run-flow';
 import { describeMeetingError } from './manager';
 import { attachMeetingAlerts } from './alerts';
+import { attachCalendarDocs } from './calendar';
+import { attachProactive } from './proactive';
+import { attachVoiceWake, calledByName } from './voice';
 import { meetingAuthzGate, meetingEffectiveAccess, meetingReadOnlyAccess } from './authz';
 import type { MeetingSession } from './session';
 import type { AccessMode, MeetingSummaryTarget, ProfileConfig } from '../config/profile-schema';
@@ -34,7 +37,9 @@ import {
   meetingArchiveFile,
   meetingArchiveId,
   meetingMinutesCard,
+  localDate,
   splitMinutesTodos,
+  TO_CONFIRM,
   type MinutesRecord,
 } from './minutes';
 import { meetingDataDir, writeMeetingJson } from './store';
@@ -64,6 +69,65 @@ export interface MeetingAgentDeps {
 /** Scope id for a meeting's agent session — one conversation per meeting. */
 export function meetingScopeId(meetingId: string): string {
   return `meeting:${meetingId}`;
+}
+
+/**
+ * Scope of one asker's in-meeting questions. Per asker, not per meeting: two
+ * people asking at once each get their own run; the same person asking again
+ * while their first answer is still running is told to wait (or stop it).
+ */
+export function meetingAskScopeId(meetingId: string, askerId: string): string {
+  return `${meetingScopeId(meetingId)}:ask:${askerId}`;
+}
+
+/**
+ * In-meeting questions running (or waiting for a process slot) at once, per
+ * meeting. Without a cap, a crowd asking together — in team mode anyone in the
+ * meeting may — would take every agent process the bridge has.
+ */
+export const MEETING_MAX_PARALLEL = 3;
+
+/** meetingId → scope → state of each in-meeting question run, from submit until it finishes. */
+const askRuns = new Map<string, Map<string, { cancelled: boolean }>>();
+
+/** Questions of this meeting in flight (for tests and status). */
+export function meetingAsksInFlight(meetingId: string): number {
+  return askRuns.get(meetingId)?.size ?? 0;
+}
+
+/**
+ * Stop a meeting's runs: one asker's (`askerId`), or every question run of
+ * the meeting (`/meeting stop`). The minutes run is never touched. A question
+ * still waiting for a process slot is cancelled too (it stops as soon as it
+ * starts). Returns how many were stopped.
+ */
+export function interruptMeetingRuns(
+  activeRuns: Pick<ActiveRuns, 'interrupt'> & Partial<Pick<ActiveRuns, 'scopes'>>,
+  meetingId: string,
+  askerId?: string,
+): number {
+  const tracked = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
+  const stopped = new Set<string>();
+  const stop = (scope: string) => {
+    if (activeRuns.interrupt(scope)) stopped.add(scope);
+    const pending = tracked.get(scope);
+    if (pending && !pending.cancelled) {
+      pending.cancelled = true;
+      stopped.add(scope);
+    }
+  };
+  if (askerId) {
+    stop(meetingAskScopeId(meetingId, askerId));
+    return stopped.size;
+  }
+  const base = meetingScopeId(meetingId);
+  const minutes = meetingMinutesScopeId(meetingId);
+  const scopes = new Set([...(activeRuns.scopes?.() ?? [base]), ...tracked.keys()]);
+  for (const scope of scopes) {
+    if (scope === minutes || (scope !== base && !scope.startsWith(`${base}:`))) continue;
+    stop(scope);
+  }
+  return stopped.size;
 }
 
 /**
@@ -210,9 +274,10 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
     const question = gate.question;
 
     if (STOP_WORDS.has(question.toLowerCase())) {
-      const stopped = deps.activeRuns.interrupt(meetingScopeId(session.meetingId));
+      // Your own question only: others' answers keep going.
+      const stopped = interruptMeetingRuns(deps.activeRuns, session.meetingId, gate.senderId) > 0;
       void session
-        .sendMessage(stopped ? '已中断当前任务。' : '当前没有正在执行的任务。')
+        .sendMessage(stopped ? '已中断你的问题。' : '你现在没有正在回答的问题。')
         .catch((err) => log.warn('meeting', 'stop-reply-failed', { err: String(err) }));
       return;
     }
@@ -234,6 +299,7 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
       elevate: gate.elevate,
       ...(usedPrefix ? { usedPrefix } : {}),
       ...(chat.from.name ? { askedBy: chat.from.name } : {}),
+      askerId: gate.senderId,
     }).catch((err) =>
       log.warn('meeting', 'answer-failed', { meetingId: session.meetingId, err: String(err) }),
     );
@@ -250,10 +316,51 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
   }
   // Additional subscriber: session.on keeps a Set per kind.
   attachMeetingAlerts(deps);
-  // Pre-meeting docs: take the ones waiting for this meeting, and bind docs
-  // shared on screen in the meeting.
+  // Pre-meeting docs: take the ones waiting for this meeting, bind docs
+  // shared on screen in the meeting, and the ones linked in its calendar event.
   adoptPendingDocsOnJoin(deps);
   attachShareDocs(deps);
+  void attachCalendarDocs(deps);
+  // Both opt-in; they check the live config on every event.
+  attachVoiceWake(
+    { session, controls, botName: () => deps.channel.botIdentity?.name },
+    (ask) => askByVoice(deps, ask),
+  );
+  attachProactive({
+    session,
+    controls,
+    selfId: () => deps.channel.botIdentity?.openId,
+    addressedToBot: (text) =>
+      matchTrigger(text, triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)) !==
+      undefined,
+    calledByName: (text) => calledByName(controls.profileConfig, deps.channel.botIdentity?.name, text),
+    run: (prompt) =>
+      runReadOnlyPrompt(deps, prompt, `${meetingScopeId(session.meetingId)}:proactive`).then((r) => r.text),
+  });
+}
+
+/** A spoken question from an allowed speaker (see voice.ts): stop words, an acknowledgement, then the answer. */
+function askByVoice(deps: MeetingAgentDeps, ask: { question: string; speakerId: string; speakerName?: string }): void {
+  const { session } = deps;
+  const who = ask.speakerName ?? '你';
+  const q = ask.question.replace(/[。.!！?？\s]+$/, '');
+  if (STOP_WORDS.has(q.toLowerCase())) {
+    const stopped = interruptMeetingRuns(deps.activeRuns, session.meetingId, ask.speakerId) > 0;
+    void session
+      .sendMessage(stopped ? `已中断 ${who} 的问题。` : `${who} 现在没有正在回答的问题。`)
+      .catch((err) => log.warn('meeting', 'stop-reply-failed', { err: String(err) }));
+    return;
+  }
+  // Speech can be misheard: say what was heard, so a wrong wake is easy to see (and stop).
+  void session
+    .sendMessage(`🎙️ 听到 ${who} 叫我：「${ask.question.slice(0, 60)}」，正在查…`)
+    .catch((err) => log.warn('meeting', 'voice-ack-failed', { err: String(err) }));
+  void answerInMeeting(deps, ask.question, {
+    deliver: 'broadcast',
+    via: 'voice',
+    askerId: ask.speakerId,
+    ...(ask.speakerName ? { askedBy: ask.speakerName } : {}),
+  }).catch((err) => log.warn('meeting', 'answer-failed', { meetingId: session.meetingId, err: String(err) }));
 }
 
 /**
@@ -277,7 +384,13 @@ export function meetingJoinNotice(profile: ProfileConfig, botName?: string): str
   const lines = [
     botName?.trim() ? `👋 我是「${name}」，AI 会议助手，已加入本场会议。` : `👋 我是 AI 会议助手，已加入本场会议。`,
     `· 我在记录本场的字幕和会中聊天（带发言人和时间），用来回答问题${m.summaryOnEnd ? '，散会后整理成纪要' : ''}。`,
-    `· 有问题在聊天里发「${ask} 你的问题」，${where}。`,
+    `· 有问题在聊天里发「${ask} 你的问题」，${where}${m.respondIn !== 'im' && m.longAnswerChars > 0 ? '；长回答这里只发要点，全文私聊发给提问的人' : ''}。`,
+    ...(m.voiceWake.enabled
+      ? [`· 授权名单里的人也可以开口叫我：句子开头说「${(m.voiceWake.names.length ? m.voiceWake.names : [name]).join('」或「')}」再说问题。`]
+      : []),
+    ...(m.proactive.enabled
+      ? [`· 会上有人提问、过一会儿没人答，而会前资料里正好有答案时，我会插一句（每场最多 ${m.proactive.maxPerMeeting} 次）。`]
+      : []),
     `· ${who}。`,
     '· 不希望被记录，可以请主持人把我移出会议。',
   ];
@@ -287,6 +400,14 @@ export function meetingJoinNotice(profile: ProfileConfig, botName?: string): str
 export interface AnswerOptions {
   /** Name of the participant who asked (in-meeting triggers only). */
   askedBy?: string;
+  /**
+   * open_id of whoever asked: their questions run in their own scope (people
+   * asking at once don't queue behind each other), and the full text of a
+   * long answer goes to their DM.
+   */
+  askerId?: string;
+  /** How the question was put: typed in the meeting chat (default) or said out loud. */
+  via?: 'chat' | 'voice';
   /**
    * Who sees the answer.
    *  - `broadcast`: deliver per `respondIn` — used when the ask came from
@@ -329,8 +450,13 @@ export async function answerInMeeting(
 ): Promise<string> {
   const { session, controls } = deps;
   const config = controls.profileConfig.meeting;
-  const transcript = opts.context?.lines ?? session.recentContext(config.transcript.keep);
+  // Time-labelled, so the answer can cite who said it when.
+  const transcript = opts.context?.lines ?? session.recentTimedContext(config.transcript.keep);
   const docs = meetingDocContext(deps, question, transcript, opts.purpose);
+  // Only an answer posted into the meeting chat is split; IM copies and
+  // `/meeting ask|notes` get everything.
+  const intoMeeting =
+    opts.deliver === 'broadcast' && opts.purpose !== 'minutes' && config.respondIn !== 'im';
   const prompt = buildMeetingPrompt({
     question,
     transcript,
@@ -338,41 +464,67 @@ export async function answerInMeeting(
     topic: session.topic,
     ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
     ...(opts.purpose ? { purpose: opts.purpose } : {}),
+    ...(opts.via === 'voice' ? { via: 'voice' as const } : {}),
+    lane: opts.deliver === 'broadcast' ? 'meeting' : 'private',
+    ...(intoMeeting && opts.askerId ? { longAnswerChars: config.longAnswerChars } : {}),
     ...docs.prompt,
   });
 
   // In-meeting chat runs at the meeting tier (or elevated); everything else
   // (`/meeting ask|notes`, the summary) is read-only: its input is meeting content.
+  // Spoken questions stay read-only too: their text is whatever speech recognition heard.
   const tier =
-    opts.deliver === 'broadcast'
+    opts.deliver === 'broadcast' && opts.via !== 'voice'
       ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
       : meetingReadOnlyAccess(controls.profileConfig);
-  const answer = await runMeetingAgent(deps, prompt, {
+  const raw = await runMeetingAgent(deps, prompt, {
     ...(opts.usedPrefix ? { usedPrefix: opts.usedPrefix } : {}),
     elevate: opts.elevate === true,
     tier,
-    ...(opts.purpose === 'minutes' ? { minutes: true } : {}),
+    ...(opts.purpose === 'minutes'
+      ? { minutes: true }
+      : opts.deliver === 'broadcast'
+        ? { scopeId: meetingAskScopeId(session.meetingId, opts.askerId ?? '?'), track: true }
+        : // `/meeting ask` from a chat: its own scope, not the asker's in-meeting one.
+          { scopeId: meetingAskScopeId(session.meetingId, `im:${opts.askerId ?? '?'}`) }),
   });
-  if (!answer) return '';
+  if (!raw) return '';
+  if (opts.purpose === 'minutes') return raw;
+  // Citations of what was said: one that matches no line given is marked, not trusted.
+  const said = transcriptCitations(raw, transcript);
+  const parts = splitAnswer(said.text, intoMeeting && opts.askerId ? config.longAnswerChars : 0);
+  const answer = parts.full;
   // Which of the provided chunks the answer actually cites — those are its
   // grounds; citations matching nothing provided are logged as unverified.
   const { cited, unverified } = docCitations(answer, docs.used);
-  if (opts.purpose !== 'minutes') {
-    recordMeetingQa(deps, {
-      question,
-      answer,
-      ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
-      provided: docs.used,
-      cited,
-      unverified,
-    });
-  }
+  recordMeetingQa(deps, {
+    question,
+    answer,
+    ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
+    provided: docs.used,
+    cited,
+    unverified,
+    said: { cited: said.cited, unverified: said.unverified },
+  });
   // The caller relays it themselves; never echo into the meeting.
   if (opts.deliver === 'caller') return answer;
 
   const target = config.respondIn;
   if (target === 'meeting' || target === 'both') {
-    await session.sendMessage(answer).catch(async (err) => {
+    let inMeeting = answer;
+    if (parts.points !== undefined && opts.askerId) {
+      // Long answer: the full text to the asker's DM first; the meeting only
+      // gets the points once that worked, otherwise the whole answer.
+      const dm = await sendAnswerToIm(deps, opts.askerId, question, answer, opts.askedBy, cited)
+        .then(() => true)
+        .catch((err) => {
+          log.warn('meeting', 'answer-dm-failed', { meetingId: session.meetingId, err: String(err) });
+          return false;
+        });
+      if (dm) inMeeting = `${parts.points}\n（完整回答已私聊发给${opts.askedBy ? ` ${opts.askedBy}` : '你'}）`;
+      log.info('meeting', 'answer-split', { meetingId: session.meetingId, chars: answer.length, dm });
+    }
+    await session.sendMessage(inMeeting).catch(async (err) => {
       const reason = describeMeetingError(err);
       log.warn('meeting', 'send-meeting-message-failed', { meetingId: session.meetingId, err: reason });
       // An answer that only exists in the log is lost. With respondIn=both and
@@ -395,6 +547,70 @@ export async function answerInMeeting(
   return answer;
 }
 
+/** Line in the model's answer that separates the key points from the full text. */
+export const FULL_TEXT_MARK = '===全文===';
+
+/**
+ * Split an answer for the meeting chat. `points` is set when it should be
+ * split: the model wrote {@link FULL_TEXT_MARK} and the whole is longer than
+ * `max`, or it is simply longer than `max` (then the points are its opening,
+ * cut at a sentence end). `full` is always the complete answer without the
+ * marker. `max` 0 never splits.
+ */
+export function splitAnswer(answer: string, max: number): { full: string; points?: string } {
+  const text = String(answer ?? '').trim();
+  const at = text.indexOf(FULL_TEXT_MARK);
+  const before = at >= 0 ? text.slice(0, at).trim() : '';
+  const after = at >= 0 ? text.slice(at + FULL_TEXT_MARK.length).trim() : '';
+  // With a marker the full text is what follows it (it restates the points);
+  // a marker with nothing after it is just noise.
+  const full = at < 0 ? text : after || before;
+  if (max <= 0 || full.length <= max) return { full };
+  if (before && before.length < full.length) return { full, points: before };
+  return { full, points: openingOf(full, Math.min(max, 200)) };
+}
+
+/** The first `max` characters, cut back to the last sentence end when there is one. */
+function openingOf(text: string, max: number): string {
+  const head = text.slice(0, max);
+  const cut = Math.max(...['。', '！', '？', '；', '\n', '. ', '! ', '? '].map((p) => head.lastIndexOf(p)));
+  return `${(cut >= max / 3 ? head.slice(0, cut + 1) : head).trim()}…`;
+}
+
+/**
+ * Citations of what was said in the meeting, 〔14:32 张三〕. One is `cited`
+ * when a line given to the model has that speaker within a minute of that
+ * time; otherwise it is `unverified` and marked in the text, so nobody takes
+ * a made-up quote for a real one. Lines are `[HH:mm:ss] who: text`.
+ */
+export function transcriptCitations(
+  answer: string,
+  lines: string[],
+): { text: string; cited: string[]; unverified: string[] } {
+  const given = lines
+    .map((l) => /^\[(\d{2}):(\d{2}):\d{2}\]\s*(.+?)(?:（弹幕）)?:\s/.exec(l))
+    .filter((m): m is RegExpExecArray => Boolean(m))
+    .map((m) => ({ min: Number(m[1]) * 60 + Number(m[2]), who: m[3]!.trim() }));
+  const cited: string[] = [];
+  const unverified: string[] = [];
+  const text = String(answer ?? '').replace(
+    /〔\s*(\d{1,2})[:：](\d{2})(?:[:：]\d{2})?\s*([^〔〕《》§\d][^〔〕《》§]{0,19}?)\s*〕/g,
+    (all, h: string, m: string, who: string) => {
+      const label = `${h.padStart(2, '0')}:${m} ${who.trim()}`;
+      const min = Number(h) * 60 + Number(m);
+      const name = who.trim();
+      const ok = given.some((g) => Math.abs(g.min - min) <= 1 && (g.who === name || g.who.includes(name) || name.includes(g.who)));
+      if (ok) {
+        if (!cited.includes(label)) cited.push(label);
+        return all;
+      }
+      if (!unverified.includes(label)) unverified.push(label);
+      return `〔${label}（未核对到原话）〕`;
+    },
+  );
+  return { text, cited, unverified };
+}
+
 export interface MeetingPromptInput {
   question: string;
   transcript: string[];
@@ -410,6 +626,15 @@ export interface MeetingPromptInput {
   materials?: UsedChunk[];
   /** Docs bound to the meeting (listed when no chunk matched, and for minutes). */
   materialList?: DocRef[];
+  /** Where the answer goes: the meeting chat (default) or only the asker. */
+  lane?: 'meeting' | 'private';
+  /**
+   * Set (above 0) when a long answer may be split: points in the meeting, the
+   * full text by DM. The model is told how to mark the split.
+   */
+  longAnswerChars?: number;
+  /** The question was said out loud (the transcript may garble it). */
+  via?: 'voice';
 }
 
 /** Compose the agent prompt: meeting context first, then the actual ask. */
@@ -428,7 +653,7 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
       ? '=== 分段摘要（按时间顺序） ==='
       : kind === 'full'
         ? '=== 会议记录（整场，按时间顺序，方括号里是时间） ==='
-        : '=== 会议记录（按时间顺序，可能不完整） ===',
+        : '=== 会议记录（最近的部分，按时间顺序，方括号里是时间） ===',
   );
   parts.push(input.transcript.length ? input.transcript.join('\n') : '（暂无字幕和弹幕）');
   parts.push(kind === 'segments' ? '=== 摘要结束 ===' : '=== 记录结束 ===');
@@ -446,23 +671,36 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
   parts.push('');
   parts.push(
     input.askedBy
-      ? `参会人「${input.askedBy}」在会中向你提问：`
+      ? input.via === 'voice'
+        ? `参会人「${input.askedBy}」在会上口头叫你、向你提问（语音转写，可能有错字）：`
+        : `参会人「${input.askedBy}」在会中向你提问：`
       : '收到的请求：',
   );
   parts.push(input.question);
   parts.push('');
   if (input.purpose === 'minutes') {
     parts.push('这是会后纪要，会发到飞书聊天里，不受 200 字限制。小标题用加粗，不要用 # 标题。');
+    return parts.join('\n');
+  }
+  if (input.lane === 'private') {
+    parts.push('请基于上面的会议上下文作答。回答只发给提问的人，不发进会议，可以完整作答，不要用 markdown 标题。');
+  } else if (input.longAnswerChars && input.longAnswerChars > 0) {
+    parts.push(
+      '请基于上面的会议上下文作答。回答会发到会议聊天里，大家都看得到。简单问题直接答，200 字内，不要用 markdown 标题。',
+      `需要展开时（清单、步骤、长解释），先写不超过 150 字的要点，然后单独一行写「${FULL_TEXT_MARK}」，后面写完整回答：会议里只显示要点，全文私聊发给提问人。`,
+    );
   } else {
     parts.push(
       '请基于上面的会议上下文作答。回答会被发到会议里，请简洁（尽量 200 字内），不要用 markdown 标题。',
     );
   }
+  parts.push('引用会上说过的话时，在那句话后面标出处〔时:分 发言人〕，时间取会议记录方括号里的时和分，如〔14:32 张三〕。');
   if (input.materials?.length) {
-    parts.push(
-      '用到会前资料时，在那句话后面照抄方括号里的出处，如〔《标题》r12 §3〕。资料和会议记录里都没有的，直接说不知道，不要编。',
-    );
+    parts.push('用到会前资料时，在那句话后面照抄方括号里的出处，如〔《标题》r12 §3〕。');
   }
+  parts.push(
+    `问的是会上说过的事或资料里的内容时，只依据会议记录${input.materials?.length || input.materialList?.length ? '和会前资料' : ''}作答；里面没有的，直接说「会上${input.materials?.length || input.materialList?.length ? '和资料里' : ''}都没有提到」，不要编，也不要拿常识补。`,
+  );
   return parts.join('\n');
 }
 
@@ -611,6 +849,7 @@ async function deliverMeetingMinutes(
   } catch (err) {
     log.warn('meeting', 'doc-context-failed', { meetingId: session.meetingId, err: String(err) });
   }
+  const people = session.speakerDirectory();
   const rec: MinutesRecord = {
     id: meetingArchiveId(session.meetingNo),
     meetingId: session.meetingId,
@@ -620,8 +859,13 @@ async function deliverMeetingMinutes(
     ...(session.originChatId ? { originChatId: session.originChatId } : {}),
     minutes: split.minutes,
     todosParsed: split.parsed,
-    todos: split.todos,
+    // An owner named in the meeting becomes assignable when the name is one participant's.
+    todos: split.todos.map((t) => {
+      const id = t.owner ? people.get(t.owner) : undefined;
+      return id ? { ...t, ownerId: id } : t;
+    }),
     docs,
+    ...(people.size ? { participants: [...people.keys()] } : {}),
     ...(session.status().transcriptText ? { transcript: session.status().transcriptText } : {}),
   };
   let archived = false;
@@ -742,7 +986,7 @@ export function buildSegmentPrompt(input: {
     '请把这一段整理成要点摘要，最后会和其他段合并成整场纪要：',
     '- 讨论了什么、谁的观点（保留关键数字、名字、时间点）',
     '- 做了哪些决定',
-    '- 提到的待办：做什么、负责人、截止时间；没提到的写「未明确」',
+    `- 提到的待办：做什么、负责人、截止时间；负责人或截止时间没明确说出来的写「${TO_CONFIRM}」，不要猜`,
     '只依据这一段的记录，不要编。直接输出摘要，不要寒暄，不要写 json。',
   ].join('\n');
 }
@@ -781,12 +1025,20 @@ export async function summarizeMeetingRecord(
   }
   const question =
     kind === 'minutes'
-      ? meetingMinutesQuestion(context.kind === 'segments')
+      ? meetingMinutesQuestion(context.kind === 'segments', localDate(Date.parse(session.startedAt) || Date.now()))
       : `请基于以上${context.kind === 'segments' ? '分段摘要' : '会议记录'}做一份简洁纪要：讨论了什么、结论、待办（如有）。`;
   return answerInMeeting(deps, question, { deliver: 'caller', purpose: 'minutes', context });
 }
 
 interface RunOptions {
+  /** Agent scope; in-meeting questions run per asker (see {@link meetingAskScopeId}). */
+  scopeId?: string;
+  /** Chat the run belongs to when there is no meeting session. */
+  chatId?: string;
+  /** A rejected run (scope busy, reconnecting) throws {@link RunRefused} instead of answering with the reason. */
+  silentReject?: boolean;
+  /** An in-meeting question: counted against {@link MEETING_MAX_PARALLEL} and stoppable while waiting. */
+  track?: boolean;
   usedPrefix?: string;
   elevate?: boolean;
   tier?: AccessMode;
@@ -803,13 +1055,84 @@ export function meetingMinutesScopeId(meetingId: string): string {
   return `meeting:${meetingId}:minutes`;
 }
 
+/** What a run needs; `session` is absent for runs outside a meeting (history questions). */
+export type RunDeps = Pick<MeetingAgentDeps, 'controls' | 'executor' | 'sessions' | 'sessionCatalog' | 'workspaces' | 'channel'> & {
+  session?: Pick<MeetingSession, 'meetingId' | 'meetingNo' | 'originChatId'>;
+};
+
+/** A run the bridge would not start (scope busy, runs paused, workspace missing…). */
+export class RunRefused extends Error {
+  constructor(
+    readonly code: string,
+    readonly userVisible: string,
+  ) {
+    super(userVisible);
+    this.name = 'RunRefused';
+  }
+}
+
+/**
+ * One read-only run in its own scope, drained into the answer text; when the
+ * bridge would not start it, `refused` says why. For work the meeting did not
+ * ask for: the unasked interjection, history questions over the archive.
+ */
+export async function runReadOnlyPrompt(
+  deps: RunDeps,
+  prompt: string,
+  scopeId: string,
+  chatId?: string,
+): Promise<{ text: string; refused?: { code: string; userVisible: string } }> {
+  try {
+    const text = await runMeetingAgent(deps, prompt, {
+      scopeId,
+      tier: meetingReadOnlyAccess(deps.controls.profileConfig),
+      silentReject: true,
+      ...(chatId ? { chatId } : {}),
+    });
+    return { text };
+  } catch (err) {
+    if (err instanceof RunRefused) return { text: '', refused: { code: err.code, userVisible: err.userVisible } };
+    throw err;
+  }
+}
+
 /** Submit one run and drain it into a single answer string. */
-async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: RunOptions = {}): Promise<string> {
-  const { session, controls } = deps;
+async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions = {}): Promise<string> {
+  const meetingId = deps.session?.meetingId;
+  const scopeId = opts.scopeId;
+  if (!opts.track || !meetingId || !scopeId) return runOnce(deps, prompt, opts);
+  const runs = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
+  // The same asker again: let the scope reservation refuse it ("你上一个问题还在回答").
+  if (runs.has(scopeId)) return runOnce(deps, prompt, opts);
+  if (runs.size >= MEETING_MAX_PARALLEL) {
+    log.info('meeting', 'ask-over-cap', { meetingId, running: runs.size });
+    return `现在已经有 ${runs.size} 个问题在回答，等其中一个答完再问我。`;
+  }
+  const state = { cancelled: false };
+  runs.set(scopeId, state);
+  askRuns.set(meetingId, runs);
+  try {
+    return await runOnce(deps, prompt, opts, state);
+  } finally {
+    runs.delete(scopeId);
+    if (runs.size === 0 && askRuns.get(meetingId) === runs) askRuns.delete(meetingId);
+  }
+}
+
+async function runOnce(
+  deps: RunDeps,
+  prompt: string,
+  opts: RunOptions,
+  state?: { cancelled: boolean },
+): Promise<string> {
+  const { controls } = deps;
+  // Without a meeting (history questions) the caller always names the scope.
+  const session = deps.session ?? { meetingId: '-', meetingNo: '-', originChatId: opts.chatId };
   const usedPrefix = opts.usedPrefix;
   const elevate = opts.elevate === true;
   const tier = opts.tier ?? meetingReadOnlyAccess(controls.profileConfig);
-  const scopeId = opts.minutes ? meetingMinutesScopeId(session.meetingId) : meetingScopeId(session.meetingId);
+  const scopeId =
+    opts.scopeId ?? (opts.minutes ? meetingMinutesScopeId(session.meetingId) : meetingScopeId(session.meetingId));
   const base =
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
@@ -830,8 +1153,8 @@ async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: Run
     // Say so in read-only runs; otherwise the agent may fail silently or pretend it did the write.
     prompt:
       tier === 'read-only'
-        ? `${prompt}\n\n[执行环境] 当前以只读权限运行，无法写文件或执行有副作用的命令。若请求需要写操作，直接说明「本次为只读模式，未执行」并给出建议，不要假装已完成。`
-        : prompt,
+        ? `${prompt}\n\n[执行环境] 当前以只读权限运行，无法写文件或执行有副作用的命令。若请求需要写操作，直接说明「本次为只读模式，未执行」并给出建议，不要假装已完成。\n${ANSWER_ONLY}`
+        : `${prompt}\n\n${ANSWER_ONLY}`,
     attachments: [],
     // Being in the meeting means "visible to every participant", not "anyone
     // may drive it": the asker was already authorized by meetingAuthzGate.
@@ -857,6 +1180,7 @@ async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: Run
       reason: result.rejectReason.code,
     });
     if (opts.minutes) throw new Error(result.rejectReason.userVisible);
+    if (opts.silentReject) throw new RunRefused(result.rejectReason.code, result.rejectReason.userVisible);
     // The generic "already running" text is a dead end inside a meeting, where
     // /stop isn't reachable — point at the in-meeting escape hatch instead.
     if (result.rejectReason.code === 'run-already-active') {
@@ -866,18 +1190,32 @@ async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: Run
         usedPrefix ??
         triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)[0] ??
         controls.profileConfig.meeting.trigger;
-      return `上一个任务还在执行。发「${prefix} stop」可以中断它，然后再问我。`;
+      // Scopes are per asker: only their own earlier question can be in the way.
+      return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
     }
     return result.rejectReason.userVisible;
   }
 
+  // Stopped while it waited for a process slot: end it before it says anything.
+  if (state?.cancelled) {
+    await result.execution.stop().catch(() => {});
+    log.info('meeting', 'ask-cancelled-before-start', { meetingId: session.meetingId });
+    return '';
+  }
+
   let answer = '';
+  /** Text since the last tool call: narration before a tool ("我先看一下…") is not the answer. */
+  let sinceTool = '';
   let failed = false;
   // Minutes must not be half an answer: an errored run throws (see below).
   try {
     for await (const event of result.execution.subscribe()) {
       const chunk = textOf(event);
-      if (chunk) answer += chunk;
+      if (chunk) {
+        answer += chunk;
+        sinceTool += chunk;
+      }
+      if (event.type === 'tool_use') sinceTool = '';
       if (event.type === 'error') {
         failed = true;
         log.warn('meeting', 'run-error', { meetingId: session.meetingId });
@@ -896,8 +1234,15 @@ async function runMeetingAgent(deps: MeetingAgentDeps, prompt: string, opts: Run
     }
   }
   if (failed && opts.minutes) throw new Error('agent 运行出错，没有完整的结果');
-  return answer.trim();
+  return (sinceTool.trim() || answer).trim();
 }
+
+/**
+ * Appended to every meeting run. Seen in a simulated meeting with the real
+ * model: in read-only (plan) mode it once opened its answer with remarks on the
+ * mode itself ("计划模式与此无关……我直接回答即可"), which went into the meeting.
+ */
+const ANSWER_ONLY = '只输出要发出去的回答本身：不要写思考过程，也不要提运行模式、权限或上面这些说明。';
 
 /** Collect assistant text from the agent event stream. */
 function textOf(event: AgentEvent): string {
