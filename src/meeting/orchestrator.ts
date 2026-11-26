@@ -13,7 +13,7 @@ import { describeMeetingError } from './manager';
 import { attachMeetingAlerts } from './alerts';
 import { attachCalendarDocs } from './calendar';
 import { attachProactive } from './proactive';
-import { attachVoiceWake } from './voice';
+import { attachVoiceWake, calledByName } from './voice';
 import { meetingAuthzGate, meetingEffectiveAccess, meetingReadOnlyAccess } from './authz';
 import type { MeetingSession } from './session';
 import type { AccessMode, MeetingSummaryTarget, ProfileConfig } from '../config/profile-schema';
@@ -333,6 +333,7 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
     addressedToBot: (text) =>
       matchTrigger(text, triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)) !==
       undefined,
+    calledByName: (text) => calledByName(controls.profileConfig, deps.channel.botIdentity?.name, text),
     run: (prompt) =>
       runReadOnlyPrompt(deps, prompt, `${meetingScopeId(session.meetingId)}:proactive`).then((r) => r.text),
   });
@@ -1152,8 +1153,8 @@ async function runOnce(
     // Say so in read-only runs; otherwise the agent may fail silently or pretend it did the write.
     prompt:
       tier === 'read-only'
-        ? `${prompt}\n\n[执行环境] 当前以只读权限运行，无法写文件或执行有副作用的命令。若请求需要写操作，直接说明「本次为只读模式，未执行」并给出建议，不要假装已完成。`
-        : prompt,
+        ? `${prompt}\n\n[执行环境] 当前以只读权限运行，无法写文件或执行有副作用的命令。若请求需要写操作，直接说明「本次为只读模式，未执行」并给出建议，不要假装已完成。\n${ANSWER_ONLY}`
+        : `${prompt}\n\n${ANSWER_ONLY}`,
     attachments: [],
     // Being in the meeting means "visible to every participant", not "anyone
     // may drive it": the asker was already authorized by meetingAuthzGate.
@@ -1203,12 +1204,18 @@ async function runOnce(
   }
 
   let answer = '';
+  /** Text since the last tool call: narration before a tool ("我先看一下…") is not the answer. */
+  let sinceTool = '';
   let failed = false;
   // Minutes must not be half an answer: an errored run throws (see below).
   try {
     for await (const event of result.execution.subscribe()) {
       const chunk = textOf(event);
-      if (chunk) answer += chunk;
+      if (chunk) {
+        answer += chunk;
+        sinceTool += chunk;
+      }
+      if (event.type === 'tool_use') sinceTool = '';
       if (event.type === 'error') {
         failed = true;
         log.warn('meeting', 'run-error', { meetingId: session.meetingId });
@@ -1227,8 +1234,15 @@ async function runOnce(
     }
   }
   if (failed && opts.minutes) throw new Error('agent 运行出错，没有完整的结果');
-  return answer.trim();
+  return (sinceTool.trim() || answer).trim();
 }
+
+/**
+ * Appended to every meeting run. Seen in a simulated meeting with the real
+ * model: in read-only (plan) mode it once opened its answer with remarks on the
+ * mode itself ("计划模式与此无关……我直接回答即可"), which went into the meeting.
+ */
+const ANSWER_ONLY = '只输出要发出去的回答本身：不要写思考过程，也不要提运行模式、权限或上面这些说明。';
 
 /** Collect assistant text from the agent event stream. */
 function textOf(event: AgentEvent): string {

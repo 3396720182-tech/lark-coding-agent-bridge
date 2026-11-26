@@ -57,6 +57,18 @@ export function matchWakeName(text: string, names: string[]): string | undefined
   return undefined;
 }
 
+/** The names that wake the bot: the configured ones, else its display name. */
+export function voiceWakeNames(profile: ProfileConfig, botName: string | undefined): string[] {
+  const cfg = profile.meeting.voiceWake;
+  const own = botName?.trim();
+  return cfg.names.length ? cfg.names : own ? [own] : [];
+}
+
+/** Is this sentence someone calling the bot by name (voice wake on)? Those are answered by the voice path. */
+export function calledByName(profile: ProfileConfig, botName: string | undefined, text: string): boolean {
+  return profile.meeting.voiceWake.enabled && matchWakeName(text, voiceWakeNames(profile, botName)) !== undefined;
+}
+
 export interface VoiceWakeDeps {
   session: MeetingSession;
   controls: RuntimeControls & { profileConfig: ProfileConfig };
@@ -85,11 +97,7 @@ export function attachVoiceWake(deps: VoiceWakeDeps, onAsk: (ask: VoiceAsk) => v
   /** Speakers who said only the name, waiting for their next sentence. */
   const waiting = new Map<string, { until: number; after: string }>();
 
-  const names = (): string[] => {
-    const cfg = controls.profileConfig.meeting.voiceWake;
-    const own = deps.botName()?.trim();
-    return cfg.names.length ? cfg.names : own ? [own] : [];
-  };
+  const names = (): string[] => voiceWakeNames(controls.profileConfig, deps.botName());
 
   const nameOnly = (text: string): boolean => {
     const rest = matchWakeName(text, names());

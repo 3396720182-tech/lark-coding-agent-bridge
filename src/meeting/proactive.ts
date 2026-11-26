@@ -77,6 +77,8 @@ export interface ProactiveDeps {
   controls: RuntimeControls & { configPath: string; profile: string; profileConfig: ProfileConfig };
   /** Is this chat message addressed to the bot (`@bot …`)? Those are answered anyway. */
   addressedToBot: (text: string) => boolean;
+  /** Is this spoken sentence someone calling the bot by name? Answered by the voice path, never an interjection. */
+  calledByName?: (text: string) => boolean;
   /** The bot's own open_id: its own messages are never questions. */
   selfId: () => string | undefined;
   /** One read-only run; '' when it could not run. */
@@ -177,6 +179,14 @@ export function attachProactive(deps: ProactiveDeps): () => void {
     const t = e as TranscriptEvent;
     if (t.selfEcho) return;
     if (!t.speaker.id) return; // no id, no way to tell who asked
+    // "小会，回滚负责人是谁？" is a question to the bot: the voice path answers it (or
+    // refuses it); it must not also use up the meeting's interjection.
+    if (deps.calledByName?.(t.text)) {
+      const prior = pending.get(`s:${t.sentenceId}`);
+      if (prior) clearTimeout(prior.timer);
+      pending.delete(`s:${t.sentenceId}`);
+      return;
+    }
     consider(`s:${t.sentenceId}`, t.text, t.speaker.id, session.seqOf(t.sentenceId), t.speaker.name);
   });
   const offChat = session.on('chat', (e) => {
