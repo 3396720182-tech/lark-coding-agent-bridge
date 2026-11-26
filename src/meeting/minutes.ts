@@ -20,31 +20,53 @@ import { meetingDataDir, readMeetingJson, writeMeetingJson } from './store';
 export const MINUTES_MAX_CHARS = 8000;
 export const MAX_TODOS = 20;
 
+/** Shown for a todo owner or deadline the meeting did not make clear. */
+export const TO_CONFIRM = '待确认';
+
 /**
  * The end-of-meeting ask. `fromSegments`: the context is per-segment summaries
  * of a long meeting rather than the record itself.
  */
-export function meetingMinutesQuestion(fromSegments = false): string {
+export function meetingMinutesQuestion(fromSegments = false, meetingDate?: string): string {
   return [
     fromSegments
       ? '会议已结束。请把以上分段摘要合并成整场会议纪要，分三部分：**讨论要点**、**结论**、**待办**。各段重复的内容合并，前后矛盾的以后面的为准。'
       : '会议已结束。请基于以上会议记录（字幕和弹幕）写一份会议纪要，分三部分：**讨论要点**、**结论**、**待办**。',
-    '待办写清做什么、负责人、截止时间；记录里没提到的写「未明确」，不要编。',
+    `待办写清做什么、负责人、截止时间。负责人和截止时间只写会上明确说出来的；没说清的（没点名、只说「尽快」「回头」、只能靠猜的）一律写「${TO_CONFIRM}」，不要自己补。`,
     '纪要正文写完后，另起一行输出一个 ```json 代码块，只放待办，格式：',
-    '{"todos":[{"task":"做什么","owner":"负责人，没有就空字符串","due":"截止时间，没有就空字符串"}]}',
+    `{"todos":[{"task":"做什么","owner":"会上明确说的负责人，没说清就空字符串","due":"会上明确说的截止时间（原话），没说清就空字符串","due_date":"截止时间能确定到具体哪天时写 YYYY-MM-DD，否则空字符串"}]}`,
+    ...(meetingDate ? [`会议日期是 ${meetingDate}，「周五」「下周一」这类说法按它换算成 due_date。`] : []),
     '没有待办就输出 {"todos":[]}。代码块之后不要再写任何内容。',
   ].join('\n');
+}
+
+/** Values that mean "not said" — the model sometimes writes them instead of leaving the field empty. */
+const UNSAID = /^(未明确|待确认|待定|未定|未知|不明|不详|无|没有|暂无|未提及|未说明|n\/?a|none|null|tbd|unknown|-+|—+|\?+|？+)$/i;
+
+/** A todo field as said in the meeting, or '' when it was not made clear. */
+export function saidOrEmpty(v: string): string {
+  const t = v.trim();
+  return UNSAID.test(t) ? '' : t;
 }
 
 export const MEETING_MINUTES_QUESTION = meetingMinutesQuestion(false);
 
 export interface MeetingTodo {
   task: string;
+  /** As said in the meeting; '' = not made clear (shown as 待确认). */
   owner: string;
   due: string;
+  /** `YYYY-MM-DD` when the deadline pins down a day. */
+  dueDate?: string;
+  /** Owner's open_id, when the name matches exactly one person heard in the meeting. */
+  ownerId?: string;
   /** Ticket id once dispatched (`T0061`). */
   ticket?: string;
   ticketAt?: string;
+  /** Feishu task once created. */
+  taskGuid?: string;
+  taskUrl?: string;
+  taskAt?: string;
 }
 
 /** A pre-meeting document as listed on the minutes (see `docs.ts`). */
@@ -68,6 +90,8 @@ export interface MinutesRecord {
   docs?: MinutesDocRef[];
   /** The readable full transcript on this machine, when it was saved. */
   transcript?: string;
+  /** Names of the people heard in the meeting (speech or chat). */
+  participants?: string[];
 }
 
 /**
@@ -98,11 +122,38 @@ export function splitMinutesTodos(answer: string): {
       .trim()
       .slice(0, max);
   const todos = arr
-    .map((t) => ({ task: field(t, 'task', 200), owner: field(t, 'owner', 40), due: field(t, 'due', 40) }))
+    .map((t): MeetingTodo => {
+      const dueDate = field(t, 'due_date', 10);
+      return {
+        task: field(t, 'task', 200),
+        owner: saidOrEmpty(field(t, 'owner', 40)),
+        due: saidOrEmpty(field(t, 'due', 40)),
+        ...(isIsoDate(dueDate) ? { dueDate } : {}),
+      };
+    })
     .filter((t) => t.task)
     .slice(0, MAX_TODOS);
   const minutes = (text.slice(0, last.index) + text.slice(last.index + last[0].length)).trim();
   return { minutes, todos, parsed: true };
+}
+
+function isIsoDate(v: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const t = new Date(`${v}T00:00:00`).getTime();
+  // Rejects 2026-02-30 and the like: they roll over to another day.
+  return !Number.isNaN(t) && localDate(t) === v;
+}
+
+/** `YYYY-MM-DD`, local time. */
+export function localDate(now = Date.now()): string {
+  const d = new Date(now);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Owner / deadline for display: as said, or 待确认. */
+export function todoWhoWhen(t: Pick<MeetingTodo, 'owner' | 'due'>): string {
+  return `负责人：${t.owner || TO_CONFIRM} · 截止：${t.due || TO_CONFIRM}`;
 }
 
 /** `YYYYMMDD-HHMM-<meeting no>`, local time. */
@@ -139,20 +190,36 @@ export function meetingMinutesCard(rec: MinutesRecord, notes: string[], archived
   if (rec.todos.length) {
     elements.push({
       tag: 'markdown',
-      content: `**待办 ${rec.todos.length} 条**${archived ? ' · 点「派成工单」交给 Larkyard 去做' : ''}`,
+      content:
+        `**待办 ${rec.todos.length} 条**` +
+        (archived ? ' · 点「派成工单」交给 Larkyard 去做，点「建成飞书任务」进飞书任务' : '') +
+        (rec.todos.some((t) => !t.owner || !t.due) ? `\n<font color='orange'>「${TO_CONFIRM}」是会上没说清的，请人工确认</font>` : ''),
     });
+    const said = (v: string) => (v ? `<font color='grey'>${v}</font>` : `<font color='orange'>${TO_CONFIRM}</font>`);
     rec.todos.forEach((t, i) => {
       elements.push({
         tag: 'markdown',
-        content: `${i + 1}. ${t.task}\n<font color='grey'>负责人：${t.owner || '未明确'} · 截止：${t.due || '未明确'}</font>`,
+        content: `${i + 1}. ${t.task}\n<font color='grey'>负责人：</font>${said(t.owner)}<font color='grey'> · 截止：</font>${said(t.due)}`,
       });
       if (archived) {
+        const arg = `${rec.id}#${i + 1}`;
+        const button = (content: string, cmd: string) => ({
+          tag: 'column',
+          width: 'auto',
+          elements: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content },
+              type: 'default',
+              size: 'small',
+              behaviors: [{ type: 'callback', value: { cmd, arg } }],
+            },
+          ],
+        });
         elements.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: '派成工单' },
-          type: 'default',
-          size: 'small',
-          behaviors: [{ type: 'callback', value: { cmd: 'meeting.todo', arg: `${rec.id}#${i + 1}` } }],
+          tag: 'column_set',
+          horizontal_spacing: '8px',
+          columns: [button('派成工单', 'meeting.todo'), button('建成飞书任务', 'meeting.task')],
         });
       }
     });
@@ -291,7 +358,7 @@ export async function handleMeetingTodo(
     const text = [
       `📌 会议待办转工单（来自「${topic}」的纪要）`,
       todo.task,
-      `负责人：${todo.owner || '未明确'} · 截止：${todo.due || '未明确'}`,
+      todoWhoWhen(todo),
     ].join('\n');
     const sent = await ctx.channel.send(ctx.chatId, { markdown: text });
     const out = await run({

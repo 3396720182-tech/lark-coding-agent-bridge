@@ -352,6 +352,48 @@ export class MeetingSession {
     return this.ordered().map((l) => `[${clockLabel(l.at)}] ${formatLine(l)}`);
   }
 
+  /**
+   * The latest lines with a `[HH:mm:ss]` label each — what in-meeting answers
+   * are given, so they can cite who said what when (〔14:32 张三〕).
+   */
+  recentTimedContext(limit?: number): string[] {
+    const all = this.ordered();
+    const slice = !limit || limit >= all.length ? all : all.slice(-limit);
+    return slice.map((l) => `[${clockLabel(l.at)}] ${formatLine(l)}`);
+  }
+
+  /** Display name → open_id for people heard in this meeting; names shared by two ids are left out. */
+  speakerDirectory(): Map<string, string> {
+    const out = new Map<string, string>();
+    const clash = new Set<string>();
+    for (const l of this.lines) {
+      if (!l.speakerId || !l.speaker || l.speaker === '?') continue;
+      const known = out.get(l.speaker);
+      if (known && known !== l.speakerId) clash.add(l.speaker);
+      else out.set(l.speaker, l.speakerId);
+    }
+    for (const n of clash) out.delete(n);
+    return out;
+  }
+
+  /** Arrival number of the newest line (0 when empty); see {@link linesAfter}. */
+  lastSeq(): number {
+    return this.seq;
+  }
+
+  /** Arrival number of a transcript sentence, if held. */
+  seqOf(sentenceId: string): number | undefined {
+    return this.bySentence.get(sentenceId)?.seq;
+  }
+
+  /** Lines that arrived after `seq`, oldest first. */
+  linesAfter(seq: number): { kind: 'speech' | 'chat'; speaker: string; speakerId?: string; text: string }[] {
+    return this.lines
+      .filter((l) => l.seq > seq)
+      .sort((a, b) => a.seq - b.seq)
+      .map((l) => ({ kind: l.kind, speaker: l.speaker, ...(l.speakerId ? { speakerId: l.speakerId } : {}), text: l.text }));
+  }
+
   /** Number of transcript lines held (chat excluded). */
   transcriptLineCount(): number {
     return this.bySentence.size;

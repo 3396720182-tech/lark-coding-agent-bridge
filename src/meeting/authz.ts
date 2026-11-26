@@ -157,3 +157,34 @@ export function meetingAuthzGate(
   }
   return { ok: true, question: text, elevate, senderId, reason: verdict.reason };
 }
+
+/**
+ * May this speaker wake the bot by saying its name? Stricter than typing:
+ * only people named on the allowlist (owner, admins, allowedUsers; admins
+ * only under `admins-only`) — team mode's "everyone may use it" does not
+ * extend to speech, where a name said in passing would start a run. A refusal
+ * is silent (logged, nothing posted): the speaker never asked for anything.
+ */
+export function meetingVoiceAllowed(
+  deps: MeetingAuthzDeps,
+  speakerId: string | undefined,
+): boolean {
+  const { controls, session } = deps;
+  const profile = controls.profileConfig;
+  if (!speakerId) return false;
+  const verdict =
+    profile.meeting.access === 'admins-only'
+      ? canRunAdminCommand(profile, controls, speakerId)
+      : canUseDm(profile, controls, speakerId);
+  // Team mode answers "allowed-team" before it looks at the lists; being on one still counts.
+  const listed = profile.access.admins.includes(speakerId) || profile.access.allowedUsers.includes(speakerId);
+  const ok = verdict.ok && (verdict.reason !== 'allowed-team' || listed);
+  if (!ok) {
+    log.info('meeting', 'voice-wake-denied', {
+      meetingId: session.meetingId,
+      sender: speakerId.slice(-6),
+      reason: verdict.ok ? 'team-mode-not-listed' : verdict.reason,
+    });
+  }
+  return ok;
+}

@@ -82,10 +82,12 @@ import { createBoundChat, defaultChatName } from '../bot/group';
 import { fetchKnownChats, type KnownChat } from '../bot/lark-info';
 import { describeMeetingError, type MeetingManager, type PushDiagnosis } from '../meeting/manager';
 import { extractMeetingNo } from '../meeting/api';
-import { answerInMeeting, meetingScopeId, summarizeMeetingRecord } from '../meeting/orchestrator';
+import { answerInMeeting, interruptMeetingRuns, summarizeMeetingRecord } from '../meeting/orchestrator';
 import { meetingAuthzSummary } from '../meeting/authz';
 import type { MeetingSession } from '../meeting/session';
 import { handleMeetingTodo } from '../meeting/minutes';
+import { handleMeetingTask } from '../meeting/tasks';
+import { answerMeetingHistory, looksLikeHistoryQuestion } from '../meeting/history';
 import { handleMeetingDoc, parseDocLinks, replyMeetingDocs } from '../meeting/docs';
 import { hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 
@@ -275,10 +277,32 @@ async function tryBindMeetingDoc(ctx: CommandContext, trimmed: string): Promise<
   return true;
 }
 
+/**
+ * "上周那个会定了什么" in a DM from an admin is answered from the minutes
+ * archive (`/meeting history`), not by the agent from memory. Needs a meeting
+ * word and a recall phrase (see looksLikeHistoryQuestion); `meeting.historyInDm:
+ * false` turns the shortcut off, `/meeting history` always works.
+ */
+async function tryAnswerMeetingHistory(ctx: CommandContext, trimmed: string): Promise<boolean> {
+  if (ctx.msg.chatType !== 'p2p') return false;
+  const m = ctx.controls.profileConfig.meeting;
+  if (!m.enabled || !m.historyInDm || !ctx.runExecutor) return false;
+  if (!looksLikeHistoryQuestion(trimmed)) return false;
+  if (!canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok) return false;
+  log.info('meeting', 'history-intercept', { sender: ctx.msg.senderId.slice(-6) });
+  try {
+    await handleMeeting(`history ${trimmed}`, ctx);
+  } catch (err) {
+    log.fail('command', err, { cmd: '/meeting', via: 'history-intercept' });
+  }
+  return true;
+}
+
 export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const trimmed = ctx.msg.content.trim();
   if (await tryJoinFromMeetingCard(ctx, trimmed)) return true;
   if (await tryBindMeetingDoc(ctx, trimmed)) return true;
+  if (await tryAnswerMeetingHistory(ctx, trimmed)) return true;
   if (!trimmed.startsWith('/')) return false;
   const parts = trimmed.split(/\s+/);
   const cmd = parts[0] ?? '';
@@ -2177,6 +2201,36 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
     case 'status':
       await replyMeetingStatus(ctx, manager);
       return;
+    case 'history': {
+      // Past meetings, from the minutes archive; no live meeting needed.
+      if (!rest) {
+        await reply(ctx, '用法：`/meeting history <问题>`，比如 `/meeting history 上周和设计组的会定了什么`。也可以直接私聊问。');
+        return;
+      }
+      if (!ctx.runExecutor) {
+        await reply(ctx, '当前上下文无法执行 agent（缺少 run executor）。');
+        return;
+      }
+      await reply(ctx, '正在查会议纪要存档…');
+      try {
+        const text = await answerMeetingHistory(
+          {
+            controls: ctx.controls,
+            channel: ctx.channel,
+            executor: ctx.runExecutor,
+            sessions: ctx.sessions,
+            ...(ctx.sessionCatalog ? { sessionCatalog: ctx.sessionCatalog } : {}),
+            workspaces: ctx.workspaces,
+            chatId: ctx.msg.chatId,
+          },
+          rest,
+        );
+        await reply(ctx, text);
+      } catch (err) {
+        await reply(ctx, `查纪要失败：${describeMeetingError(err)}`);
+      }
+      return;
+    }
     case 'join': {
       // A link, a whole sentence or a spaced-out number all work.
       const ex = extractMeetingNo(rest);
@@ -2259,14 +2313,24 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
         await reply(ctx, picked.message);
         return;
       }
-      const stopped = ctx.activeRuns.interrupt(meetingScopeId(picked.session.meetingId));
-      await reply(ctx, stopped ? '✅ 已中断该会议的当前任务。' : '该会议当前没有正在执行的任务。');
+      // Every question still running in that meeting, whoever asked.
+      const stopped = interruptMeetingRuns(ctx.activeRuns, picked.session.meetingId);
+      await reply(ctx, stopped ? `✅ 已中断该会议正在回答的 ${stopped} 个问题。` : '该会议当前没有正在执行的任务。');
       return;
     }
     case 'todo': {
       // The "派成工单" button on the minutes card lands here (admin-gated as /meeting).
       await handleMeetingTodo(
         { controls: ctx.controls, channel: ctx.channel, chatId: ctx.msg.chatId, senderId: ctx.msg.senderId },
+        rest,
+        (md) => reply(ctx, md),
+      );
+      return;
+    }
+    case 'task': {
+      // The "建成飞书任务" button on the minutes card lands here (admin-gated as /meeting).
+      await handleMeetingTask(
+        { controls: ctx.controls, channel: ctx.channel, senderId: ctx.msg.senderId },
         rest,
         (md) => reply(ctx, md),
       );
@@ -2326,7 +2390,7 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
         const answer =
           sub === 'notes'
             ? await summarizeMeetingRecord(deps, 'notes')
-            : await answerInMeeting(deps, question, { deliver: 'caller' });
+            : await answerInMeeting(deps, question, { deliver: 'caller', askerId: ctx.msg.senderId });
         await reply(ctx, answer || '（没有产生回答）');
       } catch (err) {
         await reply(ctx, `执行失败：${describeMeetingError(err)}`);
@@ -2348,6 +2412,8 @@ async function handleMeeting(args: string, ctx: CommandContext): Promise<void> {
           '`/meeting doc <飞书文档链接> [会议号]` — 绑定会前资料（也可以直接发「会前资料 <链接>」）',
           '`/meeting docs` — 看各场会绑定了哪些资料、哪个版本',
           '`/meeting doc clear [会议号]` — 清空资料绑定',
+          '`/meeting history <问题>` — 从过去的会议纪要里查（也可以直接私聊问「上周那个会定了什么」）',
+          '`/meeting task <存档号>#<第几条>` — 把纪要里的待办建成飞书任务（纪要卡片上有按钮）',
         ].join('\n'),
       );
   }
@@ -2439,11 +2505,18 @@ async function replyMeetingStatus(ctx: CommandContext, manager: MeetingManager):
     alerts.keywords.length + alerts.speakers.length === 0
       ? '提醒：未配置'
       : `提醒：关键词 ${alerts.keywords.length} 个 · 发言人 ${alerts.speakers.length} 人 · 仅私聊可见`;
+  const mc = ctx.controls.profileConfig.meeting;
+  const featureLine = [
+    `长回答分流：${mc.longAnswerChars > 0 ? `超过 ${mc.longAnswerChars} 字只发要点、全文私聊` : '关'}`,
+    `日程资料：${mc.calendarDocs ? '开' : '关'}`,
+    `主动插话：${mc.proactive.enabled ? `开（等 ${Math.round(mc.proactive.waitMs / 1000)} 秒，每场最多 ${mc.proactive.maxPerMeeting} 次）` : '关'}`,
+    `语音点名：${mc.voiceWake.enabled ? `开（${mc.voiceWake.names.length ? mc.voiceWake.names.join('、') : 'bot 名字'}，仅白名单）` : '关'}`,
+  ].join(' · ');
 
   if (sessions.length === 0) {
     await reply(
       ctx,
-      [`当前没有在跟的会议。`, authzLine, alertsLine, pushLine, '', '`/meeting join <会议链接 或 9 位会议号>` 开始。'].join('\n'),
+      [`当前没有在跟的会议。`, authzLine, alertsLine, featureLine, pushLine, '', '`/meeting join <会议链接 或 9 位会议号>` 开始。'].join('\n'),
     );
     return;
   }
@@ -2455,5 +2528,5 @@ async function replyMeetingStatus(ctx: CommandContext, manager: MeetingManager):
       (s.deniedCount ? ` · 拒绝 ${s.deniedCount} 次` : '') +
       (s.alertHits ? ` · 提醒 ${s.alertHits} 次` : ''),
   );
-  await reply(ctx, [`正在跟 ${sessions.length} 场会议：`, ...lines, '', authzLine, alertsLine, pushLine].join('\n'));
+  await reply(ctx, [`正在跟 ${sessions.length} 场会议：`, ...lines, '', authzLine, alertsLine, featureLine, pushLine].join('\n'));
 }

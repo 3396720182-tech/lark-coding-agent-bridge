@@ -519,6 +519,8 @@ export function recordMeetingQa(
     provided: UsedChunk[];
     cited: UsedChunk[];
     unverified: { title: string; revision: number; section: number }[];
+    /** Citations of what was said (〔14:32 张三〕): matched a line given, or not. */
+    said?: { cited: string[]; unverified: string[] };
   },
 ): void {
   try {
@@ -536,8 +538,12 @@ export function recordMeetingQa(
         provided: qaSections(entry.provided),
         cited,
         unverified: entry.unverified,
+        ...(entry.said ? { said: entry.said } : {}),
       }) + '\n',
     );
+    if (entry.said?.unverified.length) {
+      log.info('meeting', 'said-unverified', { meetingId: deps.session.meetingId, count: entry.said.unverified.length });
+    }
     if (cited.length || entry.unverified.length) {
       log.info('meeting', 'docs-used', {
         meetingId: deps.session.meetingId,

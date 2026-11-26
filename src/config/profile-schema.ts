@@ -146,6 +146,37 @@ export interface MeetingConfig {
    * bridge re-adopts the meeting.
    */
   announceOnJoin: boolean;
+  /**
+   * In-meeting answers longer than this many characters are split: the
+   * meeting chat gets the key points, the asker gets the full answer by DM.
+   * 0 = never split.
+   */
+  longAnswerChars: number;
+  /** On joining, bind the Feishu docs linked in the meeting's calendar event. */
+  calendarDocs: boolean;
+  /**
+   * A DM like "上周那个会定了什么" from an admin is answered from the minutes
+   * archive instead of going to the agent as an ordinary message.
+   */
+  historyInDm: boolean;
+  /** Speak up, unasked, when a question goes unanswered and the docs answer it. */
+  proactive: MeetingProactiveConfig;
+  /** Address the bot by saying its name (transcript), not only by typing. */
+  voiceWake: MeetingVoiceWakeConfig;
+}
+
+export interface MeetingProactiveConfig {
+  enabled: boolean;
+  /** How long a question must go unanswered before the bot considers it. */
+  waitMs: number;
+  /** Interjections per meeting at most. */
+  maxPerMeeting: number;
+}
+
+export interface MeetingVoiceWakeConfig {
+  enabled: boolean;
+  /** Names that wake it, said at the start of a sentence. Empty = the bot's own name. */
+  names: string[];
 }
 
 export type MeetingAccess = 'dm-policy' | 'admins-only';
@@ -470,6 +501,12 @@ export const MEETING_DEFAULTS: MeetingConfig = {
   // Empty lists = no alerts at all.
   alerts: { keywords: [], speakers: [], cooldownMs: 60_000, speakerCooldownMs: 300_000 },
   announceOnJoin: true,
+  longAnswerChars: 300,
+  calendarDocs: true,
+  historyInDm: true,
+  // Speaking up unasked and waking on speech are opt-in.
+  proactive: { enabled: false, waitMs: 20_000, maxPerMeeting: 1 },
+  voiceWake: { enabled: false, names: [] },
 };
 
 export const ATTACHMENT_BATCH_DEFAULTS = { batchThreshold: 3, batchKeep: 20 } as const;
@@ -489,6 +526,11 @@ function normalizeMeeting(input: unknown): MeetingConfig {
     elevateWord?: unknown;
     alerts?: unknown;
     announceOnJoin?: unknown;
+    longAnswerChars?: unknown;
+    calendarDocs?: unknown;
+    historyInDm?: unknown;
+    proactive?: unknown;
+    voiceWake?: unknown;
   };
   const trigger = typeof raw.trigger === 'string' && raw.trigger.trim() ? raw.trigger.trim() : MEETING_DEFAULTS.trigger;
   return {
@@ -520,7 +562,30 @@ function normalizeMeeting(input: unknown): MeetingConfig {
         : MEETING_DEFAULTS.elevateWord,
     alerts: normalizeMeetingAlerts(raw.alerts),
     announceOnJoin: raw.announceOnJoin !== false,
+    longAnswerChars: clampNumber(raw.longAnswerChars, 0, 5000, MEETING_DEFAULTS.longAnswerChars),
+    calendarDocs: raw.calendarDocs !== false,
+    historyInDm: raw.historyInDm !== false,
+    proactive: normalizeMeetingProactive(raw.proactive),
+    voiceWake: normalizeMeetingVoiceWake(raw.voiceWake),
   };
+}
+
+export function normalizeMeetingProactive(input: unknown): MeetingProactiveConfig {
+  const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>;
+  const d = MEETING_DEFAULTS.proactive;
+  return {
+    enabled: raw.enabled === true,
+    waitMs: clampNumber(raw.waitMs, 5_000, 300_000, d.waitMs),
+    maxPerMeeting: clampNumber(raw.maxPerMeeting, 1, 10, d.maxPerMeeting),
+  };
+}
+
+export function normalizeMeetingVoiceWake(input: unknown): MeetingVoiceWakeConfig {
+  const raw = (input && typeof input === 'object' && !Array.isArray(input) ? input : {}) as Record<string, unknown>;
+  const names = Array.isArray(raw.names)
+    ? [...new Set(raw.names.filter((x): x is string => typeof x === 'string').map((x) => x.trim()).filter((x) => x.length >= 2))]
+    : [];
+  return { enabled: raw.enabled === true, names };
 }
 
 /** Blank entries are dropped: an empty keyword would match every line. */

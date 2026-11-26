@@ -190,6 +190,12 @@ export function parseMeetingBody(body: unknown, current: MeetingConfig): Meeting
     elevateWord: current.elevateWord,
     alerts: current.alerts,
     announceOnJoin: typeof fv.announceOnJoin === 'boolean' ? fv.announceOnJoin : current.announceOnJoin,
+    // Not in the console form either: kept as configured.
+    longAnswerChars: current.longAnswerChars,
+    calendarDocs: current.calendarDocs,
+    historyInDm: current.historyInDm,
+    proactive: current.proactive,
+    voiceWake: current.voiceWake,
   };
 }
 

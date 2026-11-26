@@ -64,13 +64,16 @@ function record(over: Partial<MinutesRecord> = {}): MinutesRecord {
 }
 
 describe('meetingMinutesCard', () => {
-  it('one button per todo carrying archive#n, unknown owner shown, archive id in footer', () => {
+  it('two buttons per todo (ticket, Feishu task) carrying archive#n, unclear owner shown as 待确认, archive id in footer', () => {
     const json = JSON.stringify(meetingMinutesCard(record(), ['本场没收到字幕']));
     expect(json).toContain('会议纪要 · 周会');
     expect(json.match(/派成工单"/g)).toHaveLength(2);
     expect(json).toContain('"arg":"20261121-1430-123456789#2"');
     expect(json).toContain('"cmd":"meeting.todo"');
-    expect(json).toContain('负责人：未明确');
+    expect(json.match(/建成飞书任务"/g)).toHaveLength(2);
+    expect(json).toContain('"cmd":"meeting.task"');
+    expect(json).toContain("负责人：</font><font color='orange'>待确认</font>");
+    expect(json).toContain("负责人：</font><font color='grey'>甲</font>");
     expect(json).toContain('本场没收到字幕\\n存档 20261121-1430-123456789');
   });
 
