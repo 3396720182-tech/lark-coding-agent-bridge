@@ -24,6 +24,19 @@ export const MAX_TODOS = 20;
 export const TO_CONFIRM = '待确认';
 
 /**
+ * What counts as a todo, and who owns it. Without these the model turns
+ * progress reports ("监控面板我把崩溃率放到首屏") and "大家待命" into todos, leaves
+ * "日志采样率我先调到 5%" without an owner, and names departments as owners
+ * nobody can be assigned to.
+ */
+export const MINUTES_TODO_RULES = [
+  '只把会后还要去做、能落到人的事算作待办：已经做完的进度汇报（「我已经…」「我把…放到了…」）、一般性的提醒、「大家都待命」这类不算，写进讨论要点就行。',
+  '说「我来」「我把」「我去」「我先」的人就是负责人，照写他的名字，不要写待确认。',
+  `负责人是部门或团队（「市场部」「产品那边」）时照写部门名，后面加「（${TO_CONFIRM}到人）」，如「市场部（${TO_CONFIRM}到人）」。`,
+  '同一件事只写一条待办，不要拆成好几条。',
+];
+
+/**
  * The end-of-meeting ask. `fromSegments`: the context is per-segment summaries
  * of a long meeting rather than the record itself.
  */
@@ -33,6 +46,7 @@ export function meetingMinutesQuestion(fromSegments = false, meetingDate?: strin
       ? '会议已结束。请把以上分段摘要合并成整场会议纪要，分三部分：**讨论要点**、**结论**、**待办**。各段重复的内容合并，前后矛盾的以后面的为准。'
       : '会议已结束。请基于以上会议记录（字幕和弹幕）写一份会议纪要，分三部分：**讨论要点**、**结论**、**待办**。',
     `待办写清做什么、负责人、截止时间。负责人和截止时间只写会上明确说出来的；没说清的（没点名、只说「尽快」「回头」、只能靠猜的）一律写「${TO_CONFIRM}」，不要自己补。`,
+    ...MINUTES_TODO_RULES,
     '纪要正文写完后，另起一行输出一个 ```json 代码块，只放待办，格式：',
     `{"todos":[{"task":"做什么","owner":"会上明确说的负责人，没说清就空字符串","due":"会上明确说的截止时间（原话），没说清就空字符串","due_date":"截止时间能确定到具体哪天时写 YYYY-MM-DD，否则空字符串"}]}`,
     ...(meetingDate ? [`会议日期是 ${meetingDate}，「周五」「下周一」这类说法按它换算成 due_date。`] : []),
