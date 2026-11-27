@@ -492,10 +492,17 @@ export function cardButtons(sim: Sim): { text: string; value: Record<string, unk
   return out;
 }
 
-/** Clock times "HH:MM" today at local time, for transcript timestamps. */
+/**
+ * Clock times "HH:MM" at local time, for transcript timestamps. Placed on
+ * tomorrow's date so they always come after everything stamped with the real
+ * clock (typed chat, the bot's own messages): otherwise a run after 14:00 sees
+ * the bot's earlier replies as said "after" a 14:43 question, and the
+ * interjection check thinks someone answered it.
+ */
 export function at(hhmm: string): Date {
   const [h, m] = hhmm.split(':').map(Number);
   const d = new Date();
+  d.setDate(d.getDate() + 1);
   d.setHours(h!, m!, 0, 0);
   return d;
 }
