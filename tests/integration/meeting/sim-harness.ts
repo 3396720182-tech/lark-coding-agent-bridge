@@ -49,7 +49,7 @@ export const DOC = {
   revision: 7,
   text: [
     '一、发布窗口',
-    '2.4 版本计划在 12 月 5 日（周五）晚上 8 点发布，灰度比例先开 10%。',
+    '2.4 版本计划在 12 月 4 日（周五）晚上 8 点发布，灰度比例先开 10%。',
     '',
     '二、回滚条件',
     '崩溃率超过 0.3% 或者支付成功率下降 1 个百分点，立即回滚，回滚负责人是值班的后端同学。',
@@ -492,10 +492,17 @@ export function cardButtons(sim: Sim): { text: string; value: Record<string, unk
   return out;
 }
 
-/** Clock times "HH:MM" today at local time, for transcript timestamps. */
+/**
+ * Clock times "HH:MM" at local time, for transcript timestamps. Placed on
+ * tomorrow's date so they always come after everything stamped with the real
+ * clock (typed chat, the bot's own messages): otherwise a run after 14:00 sees
+ * the bot's earlier replies as said "after" a 14:43 question, and the
+ * interjection check thinks someone answered it.
+ */
 export function at(hhmm: string): Date {
   const [h, m] = hhmm.split(':').map(Number);
   const d = new Date();
+  d.setDate(d.getDate() + 1);
   d.setHours(h!, m!, 0, 0);
   return d;
 }

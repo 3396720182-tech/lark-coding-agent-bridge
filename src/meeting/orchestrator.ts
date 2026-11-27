@@ -23,6 +23,7 @@ import {
   attachShareDocs,
   docCitations,
   docLabel,
+  docTerms,
   meetingDocContext,
   meetingDocRefs,
   recordMeetingQa,
@@ -296,6 +297,7 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
     // Asked from inside the meeting → answer where the conversation is.
     void answerInMeeting(deps, question, {
       deliver: 'broadcast',
+      ackAfterMs: TYPED_ACK_MS,
       elevate: gate.elevate,
       ...(usedPrefix ? { usedPrefix } : {}),
       ...(chat.from.name ? { askedBy: chat.from.name } : {}),
@@ -330,6 +332,7 @@ export function attachMeetingAgent(deps: MeetingAgentDeps): void {
     session,
     controls,
     selfId: () => deps.channel.botIdentity?.openId,
+    botName: () => deps.channel.botIdentity?.name,
     addressedToBot: (text) =>
       matchTrigger(text, triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)) !==
       undefined,
@@ -433,6 +436,12 @@ export interface AnswerOptions {
    */
   purpose?: 'minutes';
   /**
+   * Typed in-meeting asks: when no answer is ready after this long, post a
+   * short "收到，正在查…" so the asker knows it was heard (spoken asks get
+   * their own acknowledgement up front).
+   */
+  ackAfterMs?: number;
+  /**
    * The meeting record to give instead of the last `transcript.keep` lines:
    * the whole meeting (`full`) or per-segment summaries of it (`segments`).
    */
@@ -452,6 +461,12 @@ export async function answerInMeeting(
   const config = controls.profileConfig.meeting;
   // Time-labelled, so the answer can cite who said it when.
   const transcript = opts.context?.lines ?? session.recentTimedContext(config.transcript.keep);
+  // A meeting longer than the window: say so, and look up what the question
+  // is about in the part that fell out of it.
+  const earlierOmitted = !opts.context && session.lineCount() > transcript.length;
+  const earlierLines = earlierOmitted
+    ? relevantEarlierLines(session.fullContext().slice(0, session.lineCount() - transcript.length), question)
+    : [];
   const docs = meetingDocContext(deps, question, transcript, opts.purpose);
   // Only an answer posted into the meeting chat is split; IM copies and
   // `/meeting ask|notes` get everything.
@@ -465,6 +480,8 @@ export async function answerInMeeting(
     ...(opts.askedBy ? { askedBy: opts.askedBy } : {}),
     ...(opts.purpose ? { purpose: opts.purpose } : {}),
     ...(opts.via === 'voice' ? { via: 'voice' as const } : {}),
+    ...(deps.channel.botIdentity?.name ? { botName: deps.channel.botIdentity.name } : {}),
+    ...(earlierOmitted ? { earlierOmitted, earlierLines } : {}),
     lane: opts.deliver === 'broadcast' ? 'meeting' : 'private',
     ...(intoMeeting && opts.askerId ? { longAnswerChars: config.longAnswerChars } : {}),
     ...docs.prompt,
@@ -477,6 +494,18 @@ export async function answerInMeeting(
     opts.deliver === 'broadcast' && opts.via !== 'voice'
       ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
       : meetingReadOnlyAccess(controls.profileConfig);
+  // Cleared as soon as the run is back; one already on its way is waited for
+  // before the answer goes out, so it never lands after the answer.
+  let ackSending: Promise<void> | undefined;
+  const ack =
+    opts.ackAfterMs && opts.deliver === 'broadcast' && config.respondIn !== 'im'
+      ? setTimeout(() => {
+          ackSending = session
+            .sendMessage(`⏳ 收到${opts.askedBy ? ` ${opts.askedBy} ` : '你'}的问题，正在查…`)
+            .catch((err) => log.warn('meeting', 'ask-ack-failed', { err: String(err) }));
+        }, opts.ackAfterMs)
+      : undefined;
+  ack?.unref?.();
   const raw = await runMeetingAgent(deps, prompt, {
     ...(opts.usedPrefix ? { usedPrefix: opts.usedPrefix } : {}),
     elevate: opts.elevate === true,
@@ -487,11 +516,12 @@ export async function answerInMeeting(
         ? { scopeId: meetingAskScopeId(session.meetingId, opts.askerId ?? '?'), track: true }
         : // `/meeting ask` from a chat: its own scope, not the asker's in-meeting one.
           { scopeId: meetingAskScopeId(session.meetingId, `im:${opts.askerId ?? '?'}`) }),
-  });
+  }).finally(() => clearTimeout(ack));
+  await ackSending;
   if (!raw) return '';
   if (opts.purpose === 'minutes') return raw;
   // Citations of what was said: one that matches no line given is marked, not trusted.
-  const said = transcriptCitations(raw, transcript);
+  const said = transcriptCitations(raw, [...earlierLines, ...transcript]);
   const parts = splitAnswer(said.text, intoMeeting && opts.askerId ? config.longAnswerChars : 0);
   const answer = parts.full;
   // Which of the provided chunks the answer actually cites — those are its
@@ -546,6 +576,47 @@ export async function answerInMeeting(
   }
   return answer;
 }
+
+/** At most this many lines are looked up from the part of a long meeting outside the window. */
+export const EARLIER_LINES_MAX = 20;
+
+/** Asking words that say nothing about *what* was said. */
+const ASK_NOISE =
+  /(会议上|会上|开会时|一开始|开头|刚才|之前|前面|当时|说的|说过|说了|提到|提过|讲的|讲了|是多少|多少|是什么|什么|是谁|哪天|几号|几点|怎么|为什么|一下|请问|帮我|我们|大家|？|\?|，|。|！|!)/g;
+
+/**
+ * Lines of a long meeting, outside the in-meeting window, that share words
+ * with the question: idf-weighted overlap (as for doc chunks), the best
+ * {@link EARLIER_LINES_MAX}, each with the line after it (often the reply),
+ * back in meeting order.
+ */
+export function relevantEarlierLines(lines: string[], question: string, max = EARLIER_LINES_MAX): string[] {
+  const q = [...docTerms(String(question ?? '').replace(ASK_NOISE, ' '))];
+  if (q.length === 0 || lines.length === 0) return [];
+  // Who said what, without the time ("张三一开始说了什么" finds 张三's lines);
+  // plain substring tests keep this cheap on tens of thousands of lines.
+  const texts = lines.map((l) => l.replace(/^\[[^\]]*\]\s*/, '').toLowerCase());
+  const hits = texts.map((t) => q.filter((term) => t.includes(term)));
+  const df = new Map<string, number>();
+  for (const hs of hits) for (const t of hs) df.set(t, (df.get(t) ?? 0) + 1);
+  const scored: { i: number; s: number }[] = [];
+  hits.forEach((hs, i) => {
+    let s = 0;
+    for (const t of hs) s += Math.log(1 + lines.length / df.get(t)!);
+    if (s > 0) scored.push({ i, s });
+  });
+  scored.sort((a, b) => b.s - a.s || b.i - a.i);
+  const keep = new Set<number>();
+  for (const { i } of scored) {
+    if (keep.size >= max) break;
+    keep.add(i);
+    if (i + 1 < lines.length && keep.size < max) keep.add(i + 1);
+  }
+  return [...keep].sort((a, b) => a - b).map((i) => lines[i]!);
+}
+
+/** A typed in-meeting ask still running after this long gets a "收到，正在查…" line. */
+export const TYPED_ACK_MS = 3000;
 
 /** Line in the model's answer that separates the key points from the full text. */
 export const FULL_TEXT_MARK = '===全文===';
@@ -635,6 +706,16 @@ export interface MeetingPromptInput {
   longAnswerChars?: number;
   /** The question was said out loud (the transcript may garble it). */
   via?: 'voice';
+  /** The bot's display name: its own earlier answers are in the record under it. */
+  botName?: string;
+  /**
+   * `transcript` is the latest part of a meeting that started earlier: the
+   * model must not say something "was never mentioned" just because it is
+   * not in view.
+   */
+  earlierOmitted?: boolean;
+  /** Lines from the part not in view that share words with the question (see {@link relevantEarlierLines}). */
+  earlierLines?: string[];
 }
 
 /** Compose the agent prompt: meeting context first, then the actual ask. */
@@ -657,6 +738,23 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
   );
   parts.push(input.transcript.length ? input.transcript.join('\n') : '（暂无字幕和弹幕）');
   parts.push(kind === 'segments' ? '=== 摘要结束 ===' : '=== 记录结束 ===');
+  const partial = kind === 'recent' && input.earlierOmitted === true;
+  if (partial) {
+    parts.push('');
+    parts.push('注意：上面的记录不是从开会开始的，更早的部分没有给你。');
+    if (input.earlierLines?.length) {
+      parts.push('=== 会议较早部分里和问题相关的几句（按关键词摘出，不是完整记录） ===');
+      parts.push(input.earlierLines.join('\n'));
+      parts.push('=== 摘录结束 ===');
+    }
+  }
+  const self = input.botName?.trim();
+  if (self) {
+    parts.push('');
+    parts.push(
+      `你在这场会里的名字是「${self}」：记录里「${self}」发的消息就是你之前的回答和提示。有人问「你刚才说的」，以这些记录为准，不要说自己没说过。`,
+    );
+  }
   if (input.materials?.length) {
     parts.push('');
     parts.push('=== 会前资料（按和问题的相关度摘录，方括号里是出处） ===');
@@ -698,8 +796,11 @@ export function buildMeetingPrompt(input: MeetingPromptInput): string {
   if (input.materials?.length) {
     parts.push('用到会前资料时，在那句话后面照抄方括号里的出处，如〔《标题》r12 §3〕。');
   }
+  const withDocs = Boolean(input.materials?.length || input.materialList?.length);
   parts.push(
-    `问的是会上说过的事或资料里的内容时，只依据会议记录${input.materials?.length || input.materialList?.length ? '和会前资料' : ''}作答；里面没有的，直接说「会上${input.materials?.length || input.materialList?.length ? '和资料里' : ''}都没有提到」，不要编，也不要拿常识补。`,
+    partial
+      ? `问的是会上说过的事或资料里的内容时，只依据会议记录${withDocs ? '和会前资料' : ''}作答；里面没有的，说「最近的记录${withDocs ? '和资料' : ''}里没有找到」，可以请对方说一下大概什么时候提过；不要说「会上没有提到」（更早的部分你没看到），不要编，也不要拿常识补。`
+      : `问的是会上说过的事或资料里的内容时，只依据会议记录${withDocs ? '和会前资料' : ''}作答；里面没有的，直接说「会上${withDocs ? '和资料里' : ''}都没有提到」，不要编，也不要拿常识补。`,
   );
   return parts.join('\n');
 }
@@ -1048,6 +1149,8 @@ interface RunOptions {
    * coming back as an answer.
    */
   minutes?: boolean;
+  /** Retries so far of a tracked ask whose scope was still held by a finished run. */
+  busyRetries?: number;
 }
 
 /** Scope for the minutes runs of a meeting — separate from in-meeting answers. */
@@ -1102,8 +1205,8 @@ async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions =
   const scopeId = opts.scopeId;
   if (!opts.track || !meetingId || !scopeId) return runOnce(deps, prompt, opts);
   const runs = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
-  // The same asker again: let the scope reservation refuse it ("你上一个问题还在回答").
-  if (runs.has(scopeId)) return runOnce(deps, prompt, opts);
+  // The same asker again while their question is in flight: told to wait.
+  if (runs.has(scopeId)) return busyText(deps, opts.usedPrefix);
   if (runs.size >= MEETING_MAX_PARALLEL) {
     log.info('meeting', 'ask-over-cap', { meetingId, running: runs.size });
     return `现在已经有 ${runs.size} 个问题在回答，等其中一个答完再问我。`;
@@ -1184,14 +1287,15 @@ async function runOnce(
     // The generic "already running" text is a dead end inside a meeting, where
     // /stop isn't reachable — point at the in-meeting escape hatch instead.
     if (result.rejectReason.code === 'run-already-active') {
-      // Quote back whatever the asker typed: answering someone who used the
-      // bot-name prefix with the configured one reads like a different bot.
-      const prefix =
-        usedPrefix ??
-        triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)[0] ??
-        controls.profileConfig.meeting.trigger;
+      // A tracked ask has no question of the asker's in flight (see
+      // runMeetingAgent): the scope is still held by the run that just
+      // answered, finishing up. Wait it out rather than say "上一个问题还在回答".
+      if (state && !state.cancelled && (opts.busyRetries ?? 0) < BUSY_RETRIES) {
+        await new Promise((r) => setTimeout(r, BUSY_RETRY_MS));
+        return runOnce(deps, prompt, { ...opts, busyRetries: (opts.busyRetries ?? 0) + 1 }, state);
+      }
       // Scopes are per asker: only their own earlier question can be in the way.
-      return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
+      return busyText(deps, usedPrefix);
     }
     return result.rejectReason.userVisible;
   }
@@ -1235,6 +1339,18 @@ async function runOnce(
   }
   if (failed && opts.minutes) throw new Error('agent 运行出错，没有完整的结果');
   return (sinceTool.trim() || answer).trim();
+}
+
+/** A scope still held by a run that already answered is retried this often, this many times. */
+const BUSY_RETRY_MS = 100;
+const BUSY_RETRIES = 20;
+
+/** "Your earlier question is still being answered", quoting back the prefix the asker typed. */
+function busyText(deps: RunDeps, usedPrefix: string | undefined): string {
+  const trigger = deps.controls.profileConfig.meeting.trigger;
+  // Answering someone who used the bot-name prefix with the configured one reads like a different bot.
+  const prefix = usedPrefix ?? triggerPrefixes(trigger, deps.channel.botIdentity?.name)[0] ?? trigger;
+  return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
 }
 
 /**

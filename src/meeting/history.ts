@@ -131,9 +131,12 @@ export function loadArchives(dataDir: string): MinutesRecord[] {
   return out.sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt));
 }
 
+/** Points at the meeting that just ended. */
+const JUST_NOW = /(刚才|刚刚|刚开完|刚开的|刚结束|刚散会|上一场)/;
+
 /** Words that say *when* or *how to ask*, not *which meeting*: not used for matching. */
 const NOISE =
-  /(上上周|上周|这周|本周|今天|昨天|前天|上个?月|这个?月|本月|最近|上次|上回|那个|那场|这个|会议|例会|周会|开会|的会|纪要|定了什么|定了啥|决定|结论|说了什么|聊了什么|讨论了什么|待办|谁负责|是什么|什么|一下|帮我|查查|查一下|请问|我们|你们|他们|？|\?|，|。)/g;
+  /(刚才|刚刚|刚开完|刚开的|刚结束|刚散会|散会|上一场|上上周|上周|这周|本周|今天|昨天|前天|上个?月|这个?月|本月|最近|上次|上回|那个|那场|这个|会议|例会|周会|开会|的会|纪要|定了什么|定了啥|决定|结论|说了什么|聊了什么|讨论了什么|待办|谁负责|是什么|什么|一下|帮我|查查|查一下|请问|我们|你们|他们|？|\?|，|。)/g;
 
 /** Pick the minutes a question is about: in its time window, ranked by shared words, then by recency. */
 export function pickArchives(
@@ -159,7 +162,13 @@ export function pickArchives(
   });
   // With words to go by, keep the meetings that share any; if none do, fall back to recency.
   const matched = terms.length ? scored.filter((x) => x.score > 0) : [];
-  const ranked = (matched.length ? matched : scored).sort((a, b) => b.score - a.score || a.i - b.i);
+  const pool = matched.length ? matched : scored;
+  // "刚才那个会" is one meeting: the newest that fits, not the newest few.
+  if (JUST_NOW.test(question)) {
+    const newest = [...pool].sort((a, b) => a.i - b.i)[0];
+    return { window, picked: newest ? [newest.r] : [] };
+  }
+  const ranked = pool.sort((a, b) => b.score - a.score || a.i - b.i);
   const picked: MinutesRecord[] = [];
   let size = 0;
   for (const { r } of ranked) {

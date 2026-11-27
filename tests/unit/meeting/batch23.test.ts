@@ -58,11 +58,6 @@ function fakeRun(text: string) {
   };
 }
 
-const busy = {
-  ok: false as const,
-  rejectReason: { code: 'run-already-active', userVisible: '当前会话已有运行在执行' },
-};
-
 let root: string;
 beforeEach(() => {
   vi.clearAllMocks();
@@ -194,14 +189,23 @@ describe('several people asking at once', () => {
   });
 
   it('the same person asking again while their answer runs is told to wait (not "someone else")', async () => {
-    mocks.startRunFlow.mockResolvedValue(busy);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mocks.startRunFlow.mockImplementation(async () => {
+      await gate;
+      return fakeRun('好的');
+    });
     const { session, args, meetingMsgs } = setup();
     attachMeetingAgent(args);
-    session.ingest(chat('c1', '@三儿 再问一次', '张三', 'ou_zhang'));
+    session.ingest(chat('c1', '@三儿 第一个问题', '张三', 'ou_zhang'));
+    session.ingest(chat('c2', '@三儿 再问一次', '张三', 'ou_zhang'));
     await flush();
     await flush();
     expect(meetingMsgs[0]).toContain('你上一个问题还在回答');
     expect(meetingMsgs[0]).toContain('@三儿 stop');
+    release();
+    await flush();
+    await flush();
   });
 
   it('stop in the meeting stops only the asker\'s own question; /meeting stop stops all but the minutes', () => {

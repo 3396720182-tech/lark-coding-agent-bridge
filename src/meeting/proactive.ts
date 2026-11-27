@@ -21,10 +21,27 @@ export const PROACTIVE_SKIP = 'SKIP';
 const MAX_ANSWER_CHARS = 300;
 const MIN_ANSWER_LEN = 2;
 
-/** A sentence that is plainly a question: a question mark, a question particle at the end, or a "请问" opening. */
+/**
+ * Questions to the room rather than about facts — "大家还有别的问题吗", "对吧",
+ * "行不行", "能听到吗". Docs never answer them; checking costs a run.
+ */
+const SMALL_TALK = [
+  /还有(?:没有)?(?:别的|其他|其它|什么)?(?:问题|补充|意见|要说的|想法|要讲的)(?:吗|么|没有|没)?[?？。!！\s]*$/,
+  /^大家(?:觉得|怎么看|有没有(?:别的|其他)?(?:问题|意见|补充)|还有|同意|没意见)/,
+  /(?:你们|大家|各位|你)怎么看|(?:觉得呢|觉得怎么样|觉得如何|意见呢|有意见吗|同意吗|没问题吧)[?？。!！\s]*$/,
+  // "能听到我说话吗" / "大家看得到屏幕吗"
+  /^(?:大家|你们)?(?:能|可以)?(?:听|看)得?(?:到|见|清)了?(?:我|我们)?的?(?:说话|讲话|声音|屏幕|画面|共享)?(?:吗|么|没|不)[?？。!！\s]*$/,
+];
+/** "就这么定了，对吧？": a tag on a short sentence. A longer one ("上线日期是周五对吧？") checks a fact the docs may correct. */
+const TAG = /(?:对吧|对不对|是吧|好吧|好不好|好吗|行不行|行吗|可以吗|可以不|成吗|ok吗|明白吗|清楚吗|懂了吗)[?？。!！\s]*$/i;
+const TAG_MAX_CHARS = 8;
+
+/** A sentence that is plainly a question: a question mark, a question particle at the end, or a "请问" opening. Small talk is not. */
 export function looksLikeQuestion(text: string): boolean {
   const t = String(text ?? '').trim();
   if (t.length < 5 || t.length > 200) return false;
+  if (SMALL_TALK.some((re) => re.test(t))) return false;
+  if (TAG.test(t) && t.replace(/[?？。!！\s]+$/, '').length <= TAG_MAX_CHARS) return false;
   if (/[?？]\s*$/.test(t)) return true;
   if (/(吗|么|呢)[。.!！\s]*$/.test(t)) return true;
   return /^(请问|谁知道|有没有人知道|有人知道|我想问一下|问一下)/.test(t);
@@ -37,10 +54,14 @@ export function buildProactivePrompt(input: {
   topic?: string;
   recent: string[];
   materials: UsedChunk[];
+  /** The bot's display name: its own messages in the record are under it. */
+  botName?: string;
 }): string {
+  const self = input.botName?.trim();
   return [
     '你在旁听一场飞书视频会议。会上有人提了一个问题，过了一会儿没人回答。',
     ...(input.topic ? [`会议主题：${input.topic}`] : []),
+    ...(self ? [`你在这场会里的名字是「${self}」：记录里「${self}」发的消息就是你之前说的。`] : []),
     '',
     '=== 最近的会议记录（方括号里是时间） ===',
     input.recent.length ? input.recent.join('\n') : '（暂无）',
@@ -72,6 +93,17 @@ export function proactiveAskerAllowed(
   return (p.meeting.access === 'admins-only' ? canRunAdminCommand(p, controls, id) : canUseDm(p, controls, id)).ok;
 }
 
+/**
+ * The model's own lead-in ("资料里写的是：", "根据会前资料，") would repeat the
+ * line's "会前资料里有：".
+ */
+export function tidyInterjection(answer: string): string {
+  return String(answer ?? '')
+    .trim()
+    .replace(/^(?:根据|按照|依据)?(?:会前)?资料(?:里|中|上)?(?:(?:写的是|写着|写了|显示|提到|记录)[：:，,\s]*|[：:，,]\s*)/, '')
+    .trim();
+}
+
 export interface ProactiveDeps {
   session: MeetingSession;
   controls: RuntimeControls & { configPath: string; profile: string; profileConfig: ProfileConfig };
@@ -81,6 +113,8 @@ export interface ProactiveDeps {
   calledByName?: (text: string) => boolean;
   /** The bot's own open_id: its own messages are never questions. */
   selfId: () => string | undefined;
+  /** The bot's display name, told to the model. */
+  botName?: () => string | undefined;
   /** One read-only run; '' when it could not run. */
   run: (prompt: string) => Promise<string>;
 }
@@ -118,13 +152,15 @@ export function attachProactive(deps: ProactiveDeps): () => void {
     busy = true;
     try {
       const recent = session.recentTimedContext(30);
-      const raw = (await deps.run(buildProactivePrompt({
+      const botName = deps.botName?.();
+      const raw = tidyInterjection(await deps.run(buildProactivePrompt({
         question: c.question,
         ...(c.askedBy ? { askedBy: c.askedBy } : {}),
         ...(session.topic ? { topic: session.topic } : {}),
+        ...(botName ? { botName } : {}),
         recent,
         materials: docs.used,
-      }))).trim();
+      })));
       if (!raw || raw.length < MIN_ANSWER_LEN || /^[\s"'`*「『【(（]*SKIP\b/i.test(raw) || raw.toUpperCase() === PROACTIVE_SKIP) {
         log.info('meeting', 'proactive-skip', { meetingId: session.meetingId, reason: raw ? 'model' : 'no-run' });
         return;

@@ -105,11 +105,14 @@ describe.runIf(process.env.MEETING_SIM_REAL === '1')('meeting agent batch 2/3 �
     s.say('zhang', '运维那边谁去通知一下发布窗口的事？', at('14:34'));
     s.say('li', '这个回头再说吧。', at('14:34'));
 
+    /** Meeting messages after `from` that are not the "收到，正在查…" line a slow typed ask gets. */
+    const answersSince = (from: number) => s.meetingChat.slice(from).filter((m) => !m.startsWith('⏳'));
+
     // Two at once, one short, one that needs a long answer.
     const n0 = s.meetingChat.length;
     s.chat('zhang', '@小会 刚才定的发布时间和负责人是什么？');
     s.chat('li', '@小会 详细列一下出问题时的回滚流程，分步骤，越细越好');
-    await s.waitFor(() => s.meetingChat.length >= n0 + 2, LONG, 'two answers');
+    await s.waitFor(() => answersSince(n0).length >= 2, LONG, 'two answers');
     const asks = agent.runs.filter((r) => r.prompt.includes('在会中向你提问'));
     const overlap = Math.max(asks[0]!.startedAt, asks[1]!.startedAt) < Math.min(asks[0]!.endedAt ?? Infinity, asks[1]!.endedAt ?? Infinity);
     section(
@@ -122,7 +125,7 @@ describe.runIf(process.env.MEETING_SIM_REAL === '1')('meeting agent batch 2/3 �
 
     const n1 = s.meetingChat.length;
     s.chat('zhang', '@小会 这次发布的预算是多少？');
-    await s.waitFor(() => s.meetingChat.length >= n1 + 1, LONG, 'budget');
+    await s.waitFor(() => answersSince(n1).length >= 1, LONG, 'budget');
     section('问资料和会上都没有的', quote(s.meetingChat.slice(n1).join('\n')));
 
     const n2 = s.meetingChat.length;
