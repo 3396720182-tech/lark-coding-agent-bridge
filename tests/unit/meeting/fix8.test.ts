@@ -510,3 +510,36 @@ describe('review: the "收到" line never lands after the answer', () => {
     expect(order).toEqual(['⏳ 收到 张三 的问题，正在查…', '周四']);
   });
 });
+
+describe('asking again right after an answer', () => {
+  const busy = { ok: false as const, rejectReason: { code: 'run-already-active', userVisible: '当前会话已有运行在执行' } };
+
+  it('the run that just answered still holding the scope a moment is waited out, not reported as "上一个问题还在回答"', async () => {
+    mocks.startRunFlow.mockResolvedValueOnce(busy).mockResolvedValueOnce(busy).mockResolvedValue(fakeRun('周四'));
+    const { session, args, meetingMsgs } = setup();
+    attachMeetingAgent(args);
+    session.ingest(chat('c1', '@小会 发布时间再确认一下？', '张三', 'ou_zhang'));
+    await new Promise((r) => setTimeout(r, 600));
+    expect(meetingMsgs).toEqual(['周四']);
+  });
+
+  it('a second question while the first is really running is told to wait at once', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mocks.startRunFlow.mockImplementation(async () => {
+      await gate;
+      return fakeRun('周四');
+    });
+    const { session, args, meetingMsgs } = setup();
+    attachMeetingAgent(args);
+    session.ingest(chat('c1', '@小会 发布时间再确认一下？', '张三', 'ou_zhang'));
+    session.ingest(chat('c2', '@小会 还有别的吗？', '张三', 'ou_zhang'));
+    await flush();
+    await flush();
+    expect(mocks.startRunFlow).toHaveBeenCalledTimes(1);
+    expect(meetingMsgs).toEqual(['你上一个问题还在回答，答完再问；发「@小会 stop」可以中断它。']);
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(meetingMsgs[1]).toBe('周四');
+  });
+});

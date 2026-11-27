@@ -1149,6 +1149,8 @@ interface RunOptions {
    * coming back as an answer.
    */
   minutes?: boolean;
+  /** Retries so far of a tracked ask whose scope was still held by a finished run. */
+  busyRetries?: number;
 }
 
 /** Scope for the minutes runs of a meeting — separate from in-meeting answers. */
@@ -1203,8 +1205,8 @@ async function runMeetingAgent(deps: RunDeps, prompt: string, opts: RunOptions =
   const scopeId = opts.scopeId;
   if (!opts.track || !meetingId || !scopeId) return runOnce(deps, prompt, opts);
   const runs = askRuns.get(meetingId) ?? new Map<string, { cancelled: boolean }>();
-  // The same asker again: let the scope reservation refuse it ("你上一个问题还在回答").
-  if (runs.has(scopeId)) return runOnce(deps, prompt, opts);
+  // The same asker again while their question is in flight: told to wait.
+  if (runs.has(scopeId)) return busyText(deps, opts.usedPrefix);
   if (runs.size >= MEETING_MAX_PARALLEL) {
     log.info('meeting', 'ask-over-cap', { meetingId, running: runs.size });
     return `现在已经有 ${runs.size} 个问题在回答，等其中一个答完再问我。`;
@@ -1285,14 +1287,15 @@ async function runOnce(
     // The generic "already running" text is a dead end inside a meeting, where
     // /stop isn't reachable — point at the in-meeting escape hatch instead.
     if (result.rejectReason.code === 'run-already-active') {
-      // Quote back whatever the asker typed: answering someone who used the
-      // bot-name prefix with the configured one reads like a different bot.
-      const prefix =
-        usedPrefix ??
-        triggerPrefixes(controls.profileConfig.meeting.trigger, deps.channel.botIdentity?.name)[0] ??
-        controls.profileConfig.meeting.trigger;
+      // A tracked ask has no question of the asker's in flight (see
+      // runMeetingAgent): the scope is still held by the run that just
+      // answered, finishing up. Wait it out rather than say "上一个问题还在回答".
+      if (state && !state.cancelled && (opts.busyRetries ?? 0) < BUSY_RETRIES) {
+        await new Promise((r) => setTimeout(r, BUSY_RETRY_MS));
+        return runOnce(deps, prompt, { ...opts, busyRetries: (opts.busyRetries ?? 0) + 1 }, state);
+      }
       // Scopes are per asker: only their own earlier question can be in the way.
-      return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
+      return busyText(deps, usedPrefix);
     }
     return result.rejectReason.userVisible;
   }
@@ -1336,6 +1339,18 @@ async function runOnce(
   }
   if (failed && opts.minutes) throw new Error('agent 运行出错，没有完整的结果');
   return (sinceTool.trim() || answer).trim();
+}
+
+/** A scope still held by a run that already answered is retried this often, this many times. */
+const BUSY_RETRY_MS = 100;
+const BUSY_RETRIES = 20;
+
+/** "Your earlier question is still being answered", quoting back the prefix the asker typed. */
+function busyText(deps: RunDeps, usedPrefix: string | undefined): string {
+  const trigger = deps.controls.profileConfig.meeting.trigger;
+  // Answering someone who used the bot-name prefix with the configured one reads like a different bot.
+  const prefix = usedPrefix ?? triggerPrefixes(trigger, deps.channel.botIdentity?.name)[0] ?? trigger;
+  return `你上一个问题还在回答，答完再问；发「${prefix} stop」可以中断它。`;
 }
 
 /**
