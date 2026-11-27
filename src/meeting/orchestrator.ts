@@ -494,11 +494,13 @@ export async function answerInMeeting(
     opts.deliver === 'broadcast' && opts.via !== 'voice'
       ? meetingEffectiveAccess(controls.profileConfig, opts.elevate === true)
       : meetingReadOnlyAccess(controls.profileConfig);
-  // Cleared as soon as the run is back: the acknowledgement never comes after the answer.
+  // Cleared as soon as the run is back; one already on its way is waited for
+  // before the answer goes out, so it never lands after the answer.
+  let ackSending: Promise<void> | undefined;
   const ack =
     opts.ackAfterMs && opts.deliver === 'broadcast' && config.respondIn !== 'im'
       ? setTimeout(() => {
-          void session
+          ackSending = session
             .sendMessage(`⏳ 收到${opts.askedBy ? ` ${opts.askedBy} ` : '你'}的问题，正在查…`)
             .catch((err) => log.warn('meeting', 'ask-ack-failed', { err: String(err) }));
         }, opts.ackAfterMs)
@@ -515,6 +517,7 @@ export async function answerInMeeting(
         : // `/meeting ask` from a chat: its own scope, not the asker's in-meeting one.
           { scopeId: meetingAskScopeId(session.meetingId, `im:${opts.askerId ?? '?'}`) }),
   }).finally(() => clearTimeout(ack));
+  await ackSending;
   if (!raw) return '';
   if (opts.purpose === 'minutes') return raw;
   // Citations of what was said: one that matches no line given is marked, not trusted.
@@ -579,7 +582,7 @@ export const EARLIER_LINES_MAX = 20;
 
 /** Asking words that say nothing about *what* was said. */
 const ASK_NOISE =
-  /(会议|会上|开会|一开始|开头|刚才|之前|前面|当时|说的|说过|提到|提过|讲的|是多少|多少|是什么|什么|是谁|谁|哪天|几号|几点|怎么|为什么|一下|请问|帮我|你|我们|大家|吗|呢|的|了|？|\?|，|。|！|!)/g;
+  /(会议上|会上|开会时|一开始|开头|刚才|之前|前面|当时|说的|说过|说了|提到|提过|讲的|讲了|是多少|多少|是什么|什么|是谁|哪天|几号|几点|怎么|为什么|一下|请问|帮我|我们|大家|？|\?|，|。|！|!)/g;
 
 /**
  * Lines of a long meeting, outside the in-meeting window, that share words
@@ -590,9 +593,9 @@ const ASK_NOISE =
 export function relevantEarlierLines(lines: string[], question: string, max = EARLIER_LINES_MAX): string[] {
   const q = [...docTerms(String(question ?? '').replace(ASK_NOISE, ' '))];
   if (q.length === 0 || lines.length === 0) return [];
-  // What was said, without the time and speaker; plain substring tests keep
-  // this cheap on a meeting of tens of thousands of lines.
-  const texts = lines.map((l) => l.replace(/^\[[^\]]*\]\s*[^:]*:\s*/, '').toLowerCase());
+  // Who said what, without the time ("张三一开始说了什么" finds 张三's lines);
+  // plain substring tests keep this cheap on tens of thousands of lines.
+  const texts = lines.map((l) => l.replace(/^\[[^\]]*\]\s*/, '').toLowerCase());
   const hits = texts.map((t) => q.filter((term) => t.includes(term)));
   const df = new Map<string, number>();
   for (const hs of hits) for (const t of hs) df.set(t, (df.get(t) ?? 0) + 1);

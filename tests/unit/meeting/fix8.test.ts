@@ -405,3 +405,108 @@ describe('#8 small-talk questions are not interjection candidates', () => {
     }
   });
 });
+
+// ── Review findings ──
+
+describe('review: wake names do not fire on everyday words', () => {
+  it('a near-miss needs every other character to start with the same consonant', async () => {
+    const { looksLikeWakeAttempt } = await import('../../../src/meeting/voice');
+    expect(looksLikeWakeAttempt('小黑，回滚负责人是谁？', ['小会'])).toBe(true);
+    for (const t of ['不会，回滚条件是什么？', '小李，上线时间定了吗？', '小程序，上线时间定了吗？', '销量，上个月是多少？', '一会，谁负责灰度？', '效果，怎么样？']) {
+      expect(looksLikeWakeAttempt(t, ['小会']), t).toBe(false);
+    }
+  });
+
+  it('a same-sound spelling only counts when followed by a pause or "你…"', () => {
+    for (const t of ['销毁数据的流程是什么？', '校徽设计稿谁在跟？', '小汇报一下进度', '小回顾一下', '小慧那边进度怎么样？', '晓辉明天来吗']) {
+      expect(matchWakeName(t, ['小会']), t).toBeUndefined();
+    }
+    expect(matchWakeName('小惠你查一下回滚条件', ['小会'])).toBe('你查一下回滚条件');
+    expect(matchWakeName('小惠。', ['小会'])).toBe('');
+  });
+
+  it('in mid-sentence: "你/您" plus a verb after it, and not "那个/开个 小会"', () => {
+    for (const t of ['明天那个小会你帮我约一下会议室', '这个小会帮我理清了思路', '例会，小会，复盘都要准备', '下午开个小会你看行吗']) {
+      expect(matchWakeName(t, ['小会']), t).toBeUndefined();
+    }
+    expect(matchWakeName('这个问题小会你查一下，回滚条件是什么？', ['小会'])).toBe('这个问题你查一下，回滚条件是什么？');
+  });
+});
+
+describe('review: small-talk filter keeps factual questions', () => {
+  it('questions that only look like small talk are still questions', () => {
+    for (const q of [
+      '这个日志怎么看？',
+      '监控面板怎么看崩溃率？',
+      '现在还有问题的工单有多少？',
+      '上线日期是周五对吧？',
+      '回滚条件是错误率超过5%是吧？',
+      '大家都知道上线日期是哪天吗？',
+      '大家看一下预算是多少？',
+    ]) {
+      expect(looksLikeQuestion(q), q).toBe(true);
+    }
+    for (const q of ['这个方案大家怎么看？', '还有问题吗？']) expect(looksLikeQuestion(q), q).toBe(false);
+  });
+});
+
+describe('review: "刚结束 / 刚散会 / 上一场" do not match minutes by their own words', () => {
+  it('picks the newest', () => {
+    const NOW = new Date(2026, 10, 27, 16, 0, 0).getTime();
+    const mk = (id: string, endedAt: Date, minutes: string): MinutesRecord => ({
+      id, meetingId: id, meetingNo: id.slice(-9), topic: '周会', endedAt: endedAt.toISOString(), minutes, todosParsed: true, todos: [],
+    });
+    const all = [
+      mk('20261127-1500-111111111', new Date(2026, 10, 27, 15), '定了周五发布'),
+      mk('20261126-1500-222222222', new Date(2026, 10, 26, 15), '项目结束时间待定，上一版方案作废，散会'),
+    ];
+    for (const q of ['刚结束的会定了什么', '上一场会说了什么', '刚散会的那个会结论是什么']) {
+      expect(pickArchives(all, q, NOW).picked.map((r) => r.id), q).toEqual(['20261127-1500-111111111']);
+    }
+  });
+});
+
+describe('review: the interjection keeps answers that merely start with 资料', () => {
+  it('only a lead-in with a verb or a pause is dropped', () => {
+    for (const t of ['资料库里的地址是 x', '资料说明了回滚条件', '资料中心的负责人是张三', '资料上线时间是周五']) {
+      expect(tidyInterjection(t), t).toBe(t);
+    }
+    expect(tidyInterjection('资料里写的是：每周三')).toBe('每周三');
+    expect(tidyInterjection('资料，每周三')).toBe('每周三');
+  });
+});
+
+describe('review: earlier lines by speaker, without breaking words', () => {
+  it('a question naming a speaker finds what they said', () => {
+    const earlier = ['[14:00:00] 张三: 预算定 8 万。', '[14:01:00] 李四: 回归要两天。', '[14:02:00] 王五: 我看下会议室。'];
+    expect(relevantEarlierLines(earlier, '张三一开始说了什么？')[0]).toContain('张三');
+    expect(relevantEarlierLines(earlier, '会议室订了吗？').join('\n')).toContain('会议室');
+  });
+});
+
+describe('review: the "收到" line never lands after the answer', () => {
+  it('the answer waits for an acknowledgement still being sent', async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    mocks.startRunFlow.mockImplementation(async () => {
+      await gate;
+      return fakeRun('周四');
+    });
+    const { session, args } = setup();
+    const order: string[] = [];
+    let finishAck!: () => void;
+    vi.spyOn(session, 'sendMessage').mockImplementation(async (t: string) => {
+      if (t.startsWith('⏳')) await new Promise<void>((r) => (finishAck = r));
+      order.push(t);
+    });
+    attachMeetingAgent(args);
+    session.ingest(chat('c1', '@小会 发布时间？', '张三', 'ou_zhang'));
+    await vi.advanceTimersByTimeAsync(TYPED_ACK_MS + 10); // ack started, not delivered yet
+    release();
+    await vi.advanceTimersByTimeAsync(10);
+    finishAck();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(order).toEqual(['⏳ 收到 张三 的问题，正在查…', '周四']);
+  });
+});

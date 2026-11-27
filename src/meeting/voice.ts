@@ -3,7 +3,7 @@ import type { ProfileConfig } from '../config/profile-schema';
 import type { RuntimeControls } from '../policy/access';
 import { meetingVoiceAllowed } from './authz';
 import type { MeetingSession } from './session';
-import { sameSound } from './pinyin';
+import { sameInitial, sameSound } from './pinyin';
 import type { TranscriptEvent } from './types';
 
 /**
@@ -26,8 +26,10 @@ export const VOICE_FOLLOW_MS = 10_000;
 const LEAD = /^(?:(?:嗨|嘿|哈喽|喂|hi|hey|hello|ok|okay|那个|请问|麻烦|劳驾)[\s,，、。.!！~～]*)*/i;
 const SEP = /^[\s,，、:：。.!！?？~～-]+/;
 const SEP_CHAR = /[\s,，、:：。.!！?？~～-]/;
-/** After a name in mid-sentence: "小会你查一下" / "小会帮我看看" — someone talking *to* it. */
-const ADDRESSED_AFTER = /^(?:(?:你|您)(?:帮|查|看|说|讲|总结|确认|找|列|给|算|搜|翻|整理)|帮我|帮忙)/;
+/** After a name: "小会你查一下" / "小会，您看下" — someone talking *to* it. */
+const ADDRESSED_AFTER = /^(?:你|您)(?:帮|查|看|说|讲|总结|确认|找|列|给|算|搜|翻|整理)/;
+/** Before a name in mid-sentence: "那个小会" / "开个小会" / "下午的小会" use it as a word, not a call. */
+const AS_A_WORD_BEFORE = /(?:个|的|次|场|这|那|开|些)$/;
 
 const squeeze = (s: string) => s.replace(/\s+/g, '').toLowerCase();
 
@@ -74,28 +76,33 @@ export interface WakeMatch {
 
 /**
  * Find a wake name in a sentence. At the start (after "嘿 / 请问 …"), or in
- * mid-sentence when it is plainly addressed: set off by pauses on both sides
- * ("那个，小会，你看下…") or followed by "你查 / 帮我 …" ("这个问题小会你查一下").
- * The everyday word in passing ("开个小会讨论一下") is not a call. Names match
- * case-, space- and tone-insensitively.
+ * mid-sentence when it is plainly spoken to: followed by "你查 / 您看 …"
+ * ("这个问题小会你查一下", "回滚那块，小会，你看下…"). The everyday word in
+ * passing ("开个小会讨论一下", "那个小会你帮我约下会议室") is not a call. Names
+ * match case-, space- and tone-insensitively; a same-sound spelling must
+ * stand alone (a pause or "你…" after it).
  */
 export function findWakeName(text: string, names: string[]): WakeMatch | undefined {
   const t = String(text ?? '').trim().replace(LEAD, '');
   const list = names.map(squeeze).filter((n) => n.length >= 2);
   for (const name of list) {
     const hit = nameEnd(t, 0, name);
-    if (hit) return { rest: t.slice(hit.end).replace(SEP, '').trim(), heard: t.slice(0, hit.end), exact: hit.exact };
+    if (!hit) continue;
+    const after = t.slice(hit.end).replace(/^\s+/, '');
+    // A same-sound spelling straight into the next word is a word ("销毁数据",
+    // "小汇报一下"): it has to stand alone — a pause, the end, or "你查…".
+    if (!hit.exact && after && !SEP_CHAR.test(after[0]!) && !ADDRESSED_AFTER.test(after)) continue;
+    return { rest: after.replace(SEP, '').trim(), heard: t.slice(0, hit.end), exact: hit.exact };
   }
+  // In mid-sentence only when spoken to: "（，）小会（，）你查一下…".
   for (const name of list) {
     for (let i = 1; i < t.length; i++) {
       const hit = nameEnd(t, i, name);
       if (!hit) continue;
-      const after = t.slice(hit.end).replace(/^\s+/, '');
-      const pausedBefore = SEP_CHAR.test(t[i - 1]!);
-      const pausedAfter = SEP_CHAR.test(after[0] ?? '');
-      if (!(pausedBefore && pausedAfter) && !ADDRESSED_AFTER.test(after)) continue;
-      const rest = `${t.slice(0, i)}${after.replace(SEP, '')}`.trim();
-      return { rest, heard: t.slice(i, hit.end), exact: hit.exact };
+      if (AS_A_WORD_BEFORE.test(t.slice(0, i))) continue;
+      const after = t.slice(hit.end).replace(SEP, '');
+      if (!ADDRESSED_AFTER.test(after)) continue;
+      return { rest: `${t.slice(0, i)}${after}`.trim(), heard: t.slice(i, hit.end), exact: hit.exact };
     }
   }
   return undefined;
@@ -111,8 +118,9 @@ export function matchWakeName(text: string, names: string[]): string | undefined
 
 /**
  * A sentence that opens like a call to the bot but did not match a name: a
- * short word before the first pause, sounding at least half like one ("小黑，
- * 回滚条件是什么？" for 「小会」). Not a wake, but not a question for the room
+ * word of the same length before the first pause, at least half of it the
+ * same sound and the rest starting with the same consonant ("小黑，回滚条件
+ * 是什么？" for 「小会」; not "小李，" or "销量，"). Not a wake, but not a question for the room
  * either: speech recognition may have mangled the name.
  */
 export function looksLikeWakeAttempt(text: string, names: string[]): boolean {
@@ -120,9 +128,12 @@ export function looksLikeWakeAttempt(text: string, names: string[]): boolean {
   const head = /^([^\s,，、:：。.!！?？~～-]{2,6})[\s]*[,，、:：]/.exec(t)?.[1];
   if (!head) return false;
   return names.map(squeeze).some((name) => {
-    if (name.length < 2 || Math.abs(head.length - name.length) > 1) return false;
+    if (name.length < 2 || head.length !== name.length) return false;
     let same = 0;
-    for (let k = 0; k < Math.min(head.length, name.length); k++) if (sameSound(head[k]!, name[k]!)) same += 1;
+    for (let k = 0; k < name.length; k++) {
+      if (sameSound(head[k]!, name[k]!)) same += 1;
+      else if (!sameInitial(head[k]!, name[k]!)) return false;
+    }
     return same * 2 >= name.length;
   });
 }

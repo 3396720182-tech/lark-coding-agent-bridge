@@ -120,3 +120,15 @@ export function sameSound(a: string, b: string): boolean {
   const rb = readings(b);
   return Boolean(rb && ra.some((r) => rb.includes(r)));
 }
+
+const INITIAL = /^(zh|ch|sh|[bpmfdtnlgkhjqxrzcsyw])/;
+
+/** Two Chinese characters with a reading that starts with the same consonant (黑 hei / 会 hui). Same character counts. */
+export function sameInitial(a: string, b: string): boolean {
+  if (a === b) return true;
+  const ra = readings(a);
+  const rb = readings(b);
+  if (!ra || !rb) return false;
+  const ia = ra.map((r) => INITIAL.exec(r)?.[1] ?? '');
+  return rb.some((r) => ia.includes(INITIAL.exec(r)?.[1] ?? ''));
+}
