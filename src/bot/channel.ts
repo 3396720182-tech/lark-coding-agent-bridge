@@ -67,6 +67,7 @@ import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
+import { tryTicketFastPath } from '../larkyard/ticket-fast-path';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
@@ -832,6 +833,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
     return;
   }
+
+  // Larkyard: replies on a ticket card and "停 T0005"-style controls go straight to ticketd.
+  if (await tryTicketFastPath({ channel, msg: emsg, chatMode })) return;
 
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
